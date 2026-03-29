@@ -2,17 +2,17 @@
 // src/cli/helper.rs
 //
 // FIXES APPLIED:
-//  1. Hapus `CmdKind` dari import — tidak ada di rustyline 13.
-//     Signature `highlight_char` di rustyline 13 pakai `forced: bool`, bukan CmdKind.
-//  2. Menyelesaikan konflik nama antara Trait dan Derive Macro. Kita mengimpor
-//     Trait dari submodul masing-masing, dan memanggil derive macro menggunakan
-//     path eksplisit `rustyline::NamaMacro` di dalam `#[derive(...)]`.
+//  1. Removed `CmdKind` from import — it does not exist in rustyline 13.
+//     The `highlight_char` signature in rustyline 13 uses `forced: bool`, not CmdKind.
+//  2. Resolved the name conflict between the Trait and Derive Macro. We import
+//     the Trait from their respective submodules, and call the derive macro using
+//     the explicit path `rustyline::MacroName` inside `#[derive(...)]`.
 // ============================================================================
 
 use std::collections::HashSet;
 use std::borrow::Cow;
 
-// 1. Impor Traits dari submodul spesifik (dibutuhkan untuk `impl`)
+// 1. Import Traits from specific submodules (needed for `impl`)
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::highlight::{Highlighter, MatchingBracketHighlighter};
 use rustyline::hint::{Hinter, HistoryHinter};
@@ -23,7 +23,7 @@ use rustyline::Context;
 /// MELISA CLI Helper
 /// Integrates intelligent history-based autocompletion, file path completion,
 /// and syntax highlighting for an advanced REPL experience.
-// 2. Gunakan `rustyline::` agar compiler tahu kita memanggil Derive Macro, bukan Trait
+// 2. Use `rustyline::` so the compiler knows we are calling the Derive Macro, not the Trait
 #[derive(rustyline::Helper, rustyline::Validator, rustyline::Hinter)]
 pub struct MelisaHelper {
     #[rustyline(Hinter)]
@@ -47,7 +47,7 @@ impl Highlighter for MelisaHelper {
 
     /// Handles character-level highlighting events as the user types.
     ///
-    /// FIX: rustyline 13 mengubah parameter ketiga dari `kind: CmdKind` menjadi `forced: bool`.
+    /// FIX: rustyline 13 changed the third parameter from `kind: CmdKind` to `forced: bool`.
     fn highlight_char(&self, line: &str, pos: usize, forced: bool) -> bool {
         self.highlighter.highlight_char(line, pos, forced)
     }

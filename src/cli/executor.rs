@@ -7,13 +7,13 @@
 // It parses raw input, strips the optional `--audit` flag, then delegates
 // to the appropriate domain function.
 //
-// FIX #1: Tambah handler untuk `exit`, `quit`, `cd`, dan bash passthrough.
-//          Versi lama (saferoom) mendukung semua ini — versi baru melewatkan
-//          semuanya sehingga shell tidak bisa keluar secara normal.
+// FIX #1: Added handlers for `exit`, `quit`, `cd`, and bash passthrough.
+//          The old version (saferoom) supported all of these — the new version 
+//          skipped them all so the shell could not exit normally.
 //
-// FIX #2: Operator `?` tidak bisa dipakai langsung di fungsi yang return ExecResult
-//         (bukan Result<_, _>). Solusi: macro `req!` yang perilakunya identik dengan `?`
-//         tapi kompatibel dengan semua return type.
+// FIX #2: The `?` operator cannot be used directly in functions that return ExecResult
+//         (instead of Result<_, _>). Solution: a `req!` macro whose behavior is identical to `?`
+//         but is compatible with all return types.
 // ============================================================================
 
 use tokio::io::{self, AsyncBufReadExt};
@@ -42,7 +42,7 @@ use crate::core::project::{
 use crate::distros::lxc_distro::get_lxc_distro_list;
 use crate::deployment::deployer::{cmd_up, cmd_down, cmd_mel_info};
 
-// ── FIX: Macro pengganti operator `?` untuk return type ExecResult ────────────
+// ── FIX: Replacement macro for the `?` operator for the ExecResult return type ────────────
 macro_rules! req {
     ($e:expr) => {
         match $e {
@@ -103,12 +103,12 @@ pub async fn execute_command(input: &str, user: &str, home: &str) -> ExecResult 
     }
 
     match tokens[0].as_str() {
-        // ── Sesi / navigasi ─────────────────────────────────────────────────
+        // ── Session / navigation ─────────────────────────────────────────────────
         //
-        // FIX: Versi baru sebelumnya melewatkan semua ini, sehingga:
-        //   - `exit` / `quit` tidak dikenali → shell tidak bisa ditutup
-        //   - `cd` tidak bekerja → direktori tidak bisa berubah
-        //   - Perintah shell arbitrary tidak bisa dijalankan
+        // FIX: The new version previously skipped all of this, resulting in:
+        //   - `exit` / `quit` not being recognized → the shell couldn't be closed
+        //   - `cd` not working → the directory couldn't be changed
+        //   - Arbitrary shell commands couldn't be executed
         //
         "exit" | "quit" => {
             println!(
@@ -119,8 +119,8 @@ pub async fn execute_command(input: &str, user: &str, home: &str) -> ExecResult 
         }
 
         "cd" => {
-            // Ubah direktori kerja sesi REPL secara in-process.
-            // Jika tidak ada argumen, pindah ke home directory.
+            // Change the working directory of the REPL session in-process.
+            // If there are no arguments, move to the home directory.
             let target = tokens.get(1).map(|s| s.as_str()).unwrap_or(home);
             let target = if target == "~" { home } else { target };
 
@@ -130,17 +130,17 @@ pub async fn execute_command(input: &str, user: &str, home: &str) -> ExecResult 
             }
         }
 
-        // ── Subcommand melisa ────────────────────────────────────────────────
+        // ── melisa subcommand ────────────────────────────────────────────────
         "melisa" => dispatch_melisa_subcommand(&tokens, is_audit_mode, user, home).await,
 
         // ── Bash passthrough ─────────────────────────────────────────────────
         //
-        // FIX: Perintah apapun yang tidak dikenali oleh REPL diteruskan ke
-        // bash, persis seperti versi lama. Ini memungkinkan user menjalankan
-        // tool sistem (git, vim, python3, dll.) langsung dari dalam shell MELISA.
+        // FIX: Any command not recognized by the REPL is passed through to
+        // bash, exactly like the old version. This allows the user to run
+        // system tools (git, vim, python3, etc.) directly from within the MELISA shell.
         //
         _ => {
-            // Tambahkan ~/.cargo/bin ke PATH agar binary Rust user tersedia.
+            // Add ~/.cargo/bin to PATH so that the user's Rust binaries are available.
             let cargo_bin = format!("{}/.cargo/bin", home);
             let path_env = format!(
                 "{}:{}",
@@ -519,7 +519,7 @@ async fn dispatch_melisa_subcommand(
             ExecResult::Continue
         }
 
-        // ── Subcommand kosong ────────────────────────────────────────────────
+        // ── Empty subcommand ────────────────────────────────────────────────
         "" => {
             println!(
                 "{}[ERROR]{} Incomplete command. Execute 'melisa --help' for usage.",

@@ -4,17 +4,17 @@
 // LXC container lifecycle management:
 //   create, delete, start, stop, attach.
 //
-// FIX #1: `create_container` sebelumnya berhenti setelah DNS setup.
-//         Versi lama melakukan banyak langkah krusial yang hilang:
-//           a) Verifikasi bridge lxcbr0 sebelum membuat container
-//           b) Inject metadata MELISA ke rootfs container
-//           c) Start container setelah dibuat
-//           d) Tunggu sampai DHCP/network container siap
-//           e) Jalankan update package manager awal
-//         Tanpa langkah-langkah ini, container dibuat tapi tidak bisa dipakai.
+// FIX #1: `create_container` previously stopped after DNS setup.
+//         The old version performed many crucial steps that were missing:
+//           a) Verify the lxcbr0 bridge before creating the container
+//           b) Inject MELISA metadata into the container's rootfs
+//           c) Start the container after creation
+//           d) Wait until the container's DHCP/network is ready
+//           e) Run the initial package manager update
+//         Without these steps, the container was created but could not be used.
 //
-// FIX #2: `delete_container` memanggil `cleanup_container_metadata` dari modul
-//         metadata baru — ini sudah benar di versi baru.
+// FIX #2: `delete_container` calls `cleanup_container_metadata` from the new
+//         metadata module — this is already correct in the new version.
 //
 // All functions that mutate container state require admin privileges and
 // accept an `audit` flag that controls subprocess output visibility.
@@ -52,8 +52,8 @@ async fn run_sudo(args: &[&str], is_audit: bool) -> std::io::Result<std::process
 
 /// Verifies that the host network bridge `lxcbr0` is active.
 ///
-/// Jika bridge tidak ditemukan, mencoba repair otomatis via `ensure_host_network_ready`.
-/// Tanpa bridge ini, container tidak akan mendapat IP dari DHCP.
+/// If the bridge is not found, attempts automatic repair via `ensure_host_network_ready`.
+/// Without this bridge, the container will not get an IP from DHCP.
 ///
 /// # Arguments
 /// * `audit` - When `true`, subprocess output is forwarded to the terminal.
@@ -69,7 +69,7 @@ async fn verify_host_runtime(audit: bool) -> bool {
         YELLOW, RESET
     );
     ensure_host_network_ready(audit).await;
-    // Cek ulang setelah repair
+    // Recheck after repair
     Path::new("/sys/class/net/lxcbr0").exists()
 }
 
@@ -77,9 +77,9 @@ async fn verify_host_runtime(audit: bool) -> bool {
 
 /// Polls the container until it gets a DHCP lease (appears in `lxc-info -iH`).
 ///
-/// Setelah container start, butuh waktu beberapa detik untuk DHCP assign IP.
-/// Versi lama melakukan polling ini — versi baru melewatkannya sehingga
-/// package manager update gagal karena network belum siap.
+/// After the container starts, it takes a few seconds for DHCP to assign an IP.
+/// The old version polled this — the new version skipped it, causing
+/// the package manager update to fail because the network wasn't ready.
 ///
 /// # Arguments
 /// * `name` - Container name.
@@ -106,7 +106,7 @@ async fn wait_for_network_initialization(name: &str, pb: &ProgressBar) -> bool {
                     "{}[INFO]{} Network connection established (IP: {}). Allowing DNS resolver to settle...",
                     YELLOW, RESET, ips.trim()
                 ));
-                // Beri waktu resolver sedikit agar `/etc/resolv.conf` lock tidak interfere
+                // Give the resolver a little time so the `/etc/resolv.conf` lock doesn't interfere
                 sleep(Duration::from_secs(3)).await;
                 return true;
             }
@@ -120,8 +120,8 @@ async fn wait_for_network_initialization(name: &str, pb: &ProgressBar) -> bool {
 
 /// Maps a distro name (lowercase) to the appropriate package manager command.
 ///
-/// Digunakan untuk menjalankan update awal setelah container start, tanpa
-/// harus probe ke dalam container (yang bisa gagal jika paket manager belum settled).
+/// Used to run the initial update after the container starts, without
+/// having to probe into the container (which could fail if the package manager hasn't settled).
 fn get_pkg_manager_for_distro(distro_name: &str) -> &'static str {
     let name = distro_name.to_lowercase();
     if name.contains("ubuntu") || name.contains("debian") || name.contains("kali")
@@ -159,8 +159,8 @@ fn get_pkg_update_cmd(pkg_manager: &str) -> &'static str {
 
 /// Runs the package manager update inside the container as initial setup.
 ///
-/// Versi lama melakukan ini setelah network siap — versi baru tidak melakukan
-/// ini sama sekali sehingga container perlu diupdate manual sebelum bisa install apapun.
+/// The old version did this after the network was ready — the new version didn't do
+/// this at all, so the container needed to be manually updated before anything could be installed.
 async fn auto_initial_setup(name: &str, distro_name: &str, pb: &ProgressBar, audit: bool) {
     let pm = get_pkg_manager_for_distro(distro_name);
     let cmd = get_pkg_update_cmd(pm);
@@ -210,21 +210,21 @@ async fn auto_initial_setup(name: &str, distro_name: &str, pb: &ProgressBar, aud
 
 /// Builds and writes MELISA metadata into the container's rootfs.
 ///
-/// Metadata disimpan di `<LXC_BASE_PATH>/<name>/rootfs/etc/melisa-info`.
-/// Tanpa ini, `melisa --info <container>` tidak akan menampilkan data apapun.
+/// Metadata is saved at `<LXC_BASE_PATH>/<name>/rootfs/etc/melisa-info`.
+/// Without this, `melisa --info <container>` will not display any data.
 ///
 /// # Arguments
 /// * `name` - Container name.
 /// * `meta` - Distribution metadata for the container.
 async fn inject_container_metadata(name: &str, meta: &DistroMetadata) {
-    // Extract release dari slug (format: "distro/release/arch")
+    // Extract release from slug (format: "distro/release/arch")
     let release = meta.slug
         .split('/')
         .nth(1)
         .unwrap_or("unknown")
         .to_string();
 
-    // Generate ID sederhana berbasis timestamp + random bytes (tidak butuh crate uuid)
+    // Generate a simple ID based on timestamp + random bytes (no need for the uuid crate)
     let ts = Local::now().timestamp_micros();
     let rand_bytes: u32 = rand::random();
     let instance_id = format!("{:x}-{:08x}", ts, rand_bytes);
@@ -258,15 +258,15 @@ async fn inject_container_metadata(name: &str, meta: &DistroMetadata) {
 
 /// Creates a new unprivileged LXC container from the specified distribution.
 ///
-/// Pipeline lengkap (semua langkah krusial yang hilang di versi baru):
-/// 1. Verifikasi host runtime (bridge lxcbr0)
-/// 2. Download dan provision via `lxc-create`
+/// Complete pipeline (all crucial steps missing in the new version):
+/// 1. Verify host runtime (lxcbr0 bridge)
+/// 2. Download and provision via `lxc-create`
 /// 3. Inject network configuration
 /// 4. Configure DNS (locked with `chattr +i`)
 /// 5. Write MELISA metadata
-/// 6. Start container
-/// 7. Tunggu network/DHCP siap
-/// 8. Jalankan package manager update awal
+/// 6. Start the container
+/// 7. Wait for network/DHCP to be ready
+/// 8. Run initial package manager update
 ///
 /// # Arguments
 /// * `name`   - Target container name.
@@ -279,8 +279,8 @@ pub async fn create_container(
     pb: ProgressBar,
     audit: bool,
 ) {
-    // ── Step 0: Verifikasi bridge host ────────────────────────────────────
-    // FIX: Tanpa ini, container tidak akan mendapat IP dan tidak bisa digunakan.
+    // ── Step 0: Verify host bridge ────────────────────────────────────
+    // FIX: Without this, the container won't get an IP and cannot be used.
     if !verify_host_runtime(audit).await {
         pb.println(format!(
             "{}[ERROR]{} Host network bridge 'lxcbr0' is down and auto-repair failed.{}",
@@ -298,7 +298,7 @@ pub async fn create_container(
         BOLD, RESET, name, meta.slug
     ));
 
-    // Pecah slug "distro/release/arch" menjadi komponen terpisah untuk lxc-create
+    // Split the "distro/release/arch" slug into separate components for lxc-create
     let slug_parts: Vec<&str> = meta.slug.splitn(3, '/').collect();
     let (distro, release, arch) = match slug_parts.as_slice() {
         [d, r, a] => (*d, *r, *a),
@@ -318,7 +318,7 @@ pub async fn create_container(
         ));
     }
 
-    // ── Step 1: Buat container ────────────────────────────────────────────
+    // ── Step 1: Create container ────────────────────────────────────────────
     let status = Command::new("sudo")
         .args(&[
             "lxc-create",
@@ -357,7 +357,7 @@ pub async fn create_container(
             setup_container_dns(name, &pb).await;
 
             // ── Step 4: Inject MELISA metadata ────────────────────────────
-            // FIX: Tanpa ini, `melisa --info` tidak menampilkan data apapun.
+            // FIX: Without this, `melisa --info` won't display any data.
             pb.println(format!(
                 "{}[INFO]{} Writing MELISA metadata for '{}'…",
                 BOLD, RESET, name
@@ -365,19 +365,19 @@ pub async fn create_container(
             inject_container_metadata(name, &meta).await;
 
             // ── Step 5: Start container ───────────────────────────────────
-            // FIX: Versi lama selalu start container setelah create.
-            //      Versi baru tidak melakukan ini sama sekali.
+            // FIX: The old version always started the container after creation.
+            //      The new version didn't do this at all.
             pb.println(format!(
                 "{}[INFO]{} Starting container '{}' for initial setup…",
                 YELLOW, RESET, name
             ));
             start_container(name, audit).await;
 
-            // ── Step 6: Tunggu network siap ───────────────────────────────
-            // FIX: Tanpa ini, package update langsung gagal karena network belum ready.
+            // ── Step 6: Wait for network readiness ───────────────────────────────
+            // FIX: Without this, the package update fails immediately because the network isn't ready.
             if wait_for_network_initialization(name, &pb).await {
                 // ── Step 7: Update package manager ────────────────────────
-                // FIX: Initial update agar user bisa langsung install package.
+                // FIX: Initial update so the user can immediately install packages.
                 auto_initial_setup(name, distro, &pb, audit).await;
             } else {
                 pb.println(format!(
