@@ -286,12 +286,12 @@ mod tests {
         );
     }
 
+    // sudoers.rs — di dalam mod tests
     #[test]
     fn test_build_sudoers_rule_admin_is_superset_of_regular() {
         let regular_rule = build_sudoers_rule("alice", &UserRole::Regular);
-        let admin_rule = build_sudoers_rule("bob", &UserRole::Admin);
+        let admin_rule   = build_sudoers_rule("alice", &UserRole::Admin); // sama: "alice"
 
-        // Every command in the regular rule must also exist in the admin rule.
         for cmd in regular_rule.split(", ") {
             let cmd_trimmed = cmd.trim().trim_end_matches('\n');
             assert!(
@@ -301,7 +301,6 @@ mod tests {
             );
         }
     }
-
     #[test]
     fn test_build_sudoers_rule_format_contains_username() {
         let rule = build_sudoers_rule("charlie", &UserRole::Regular);
