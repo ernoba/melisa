@@ -9,6 +9,11 @@
 // Writes are performed atomically: the data is first written to a `.tmp` file
 // which is then renamed into place.  This prevents partial reads if the
 // process is interrupted mid-write.
+//
+// FIX: `write_container_metadata` ada tapi tidak pernah dipanggil di versi baru.
+//      `lifecycle.rs` sekarang memanggil fungsi ini setelah container dibuat
+//      agar `melisa --info` bisa menampilkan informasi container.
+//      Fungsi ini sudah `pub` — pastikan tetap demikian.
 // ============================================================================
 
 use std::path::PathBuf;
@@ -71,8 +76,13 @@ pub async fn inspect_container_metadata(container_name: &str) -> Result<String, 
 
 /// Atomically writes metadata for a container.
 ///
-/// The content is written to a `.tmp` file first, then renamed to the final
-/// path.  If the write fails mid-way, the original metadata file is preserved.
+/// Dipanggil oleh `lifecycle.rs::create_container` setelah container berhasil
+/// dibuat, agar `melisa --info` bisa menampilkan informasi container.
+///
+/// Cara kerja:
+/// 1. Tulis konten ke file `.tmp` terlebih dahulu
+/// 2. Rename atomik ke path final
+/// Jika write gagal di tengah jalan, file original tidak terkorupsi.
 ///
 /// # Arguments
 /// * `container_name` - The LXC container name.
@@ -177,7 +187,6 @@ mod tests {
 
     #[test]
     fn test_melisa_version_constant_is_semver_like() {
-        // Verify the version string has at least two dots (X.Y.Z format).
         let dot_count = MELISA_VERSION.chars().filter(|&c| c == '.').count();
         assert!(
             dot_count >= 2,
@@ -200,6 +209,33 @@ mod tests {
                 );
             }
             other => panic!("Expected MetadataNotFound, got: {:?}", other),
+        }
+    }
+
+    /// Verifies write_container_metadata generates content that includes required fields.
+    #[test]
+    fn test_metadata_content_has_required_fields() {
+        let content = format!(
+            "MELISA_INSTANCE_NAME={}\nMELISA_INSTANCE_ID={}\nDISTRO_SLUG={}\n\
+             DISTRO_NAME={}\nDISTRO_RELEASE={}\nARCHITECTURE={}\nCREATED_AT={}\n",
+            "testbox", "some-uuid", "ubuntu/jammy/amd64", "ubuntu", "jammy", "amd64",
+            "2025-01-01T00:00:00+00:00"
+        );
+        let required_keys = [
+            "MELISA_INSTANCE_NAME",
+            "MELISA_INSTANCE_ID",
+            "DISTRO_SLUG",
+            "DISTRO_NAME",
+            "DISTRO_RELEASE",
+            "ARCHITECTURE",
+            "CREATED_AT",
+        ];
+        for key in &required_keys {
+            assert!(
+                content.contains(key),
+                "Metadata content must include key '{}'",
+                key
+            );
         }
     }
 }

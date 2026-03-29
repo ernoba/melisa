@@ -7,13 +7,18 @@
 // It parses raw input, strips the optional `--audit` flag, then delegates
 // to the appropriate domain function.
 //
-// FIX: Operator `?` tidak bisa dipakai langsung di fungsi yang return ExecResult
-// (bukan Result<_, _>). Solusi: macro `req!` yang perilakunya identik dengan `?`
-// tapi kompatibel dengan semua return type.
+// FIX #1: Tambah handler untuk `exit`, `quit`, `cd`, dan bash passthrough.
+//          Versi lama (saferoom) mendukung semua ini — versi baru melewatkan
+//          semuanya sehingga shell tidak bisa keluar secara normal.
+//
+// FIX #2: Operator `?` tidak bisa dipakai langsung di fungsi yang return ExecResult
+//         (bukan Result<_, _>). Solusi: macro `req!` yang perilakunya identik dengan `?`
+//         tapi kompatibel dengan semua return type.
 // ============================================================================
 
 use tokio::io::{self, AsyncBufReadExt};
 use std::io::Write;
+use std::env;
 
 use crate::cli::color::{RED, GREEN, YELLOW, BOLD, RESET};
 use crate::cli::loading::execute_with_spinner;
@@ -38,14 +43,6 @@ use crate::distros::lxc_distro::get_lxc_distro_list;
 use crate::deployment::deployer::{cmd_up, cmd_down, cmd_mel_info};
 
 // ── FIX: Macro pengganti operator `?` untuk return type ExecResult ────────────
-//
-// `require_arg` mengembalikan `Result<&str, ExecResult>`.
-// Fungsi `dispatch_melisa_subcommand` mengembalikan `ExecResult` (bukan Result),
-// sehingga `?` tidak bisa dikompilasi — Rust tidak tahu cara mengonversi error ke ExecResult.
-//
-// `req!(expr)` melakukan hal yang persis sama dengan `?`:
-//   - Jika Ok(v)  → pakai v
-//   - Jika Err(r) → return r langsung ke pemanggil
 macro_rules! req {
     ($e:expr) => {
         match $e {
@@ -76,13 +73,6 @@ pub enum ExecResult {
 ///
 /// The `--audit` flag may appear anywhere in the input.  It is stripped from
 /// the token list before the caller processes arguments.
-///
-/// # Arguments
-/// * `input` - Raw string from the REPL.
-///
-/// # Returns
-/// A tuple of `(Vec<String>, bool)` where the `bool` is `true` when `--audit`
-/// was present.
 pub fn parse_command(input: &str) -> (Vec<String>, bool) {
     let raw_tokens: Vec<&str> = input.split_whitespace().collect();
     let is_audit_mode = raw_tokens.contains(&"--audit");
@@ -113,13 +103,68 @@ pub async fn execute_command(input: &str, user: &str, home: &str) -> ExecResult 
     }
 
     match tokens[0].as_str() {
-        "melisa" => dispatch_melisa_subcommand(&tokens, is_audit_mode, user, home).await,
-        other => {
+        // ── Sesi / navigasi ─────────────────────────────────────────────────
+        //
+        // FIX: Versi baru sebelumnya melewatkan semua ini, sehingga:
+        //   - `exit` / `quit` tidak dikenali → shell tidak bisa ditutup
+        //   - `cd` tidak bekerja → direktori tidak bisa berubah
+        //   - Perintah shell arbitrary tidak bisa dijalankan
+        //
+        "exit" | "quit" => {
             println!(
-                "{}[ERROR]{} Unknown command '{}'. Type 'melisa --help' for usage.",
-                RED, RESET, other
+                "{}[SYSTEM]{} Terminating secure session... Goodbye.{}",
+                BOLD, YELLOW, RESET
             );
-            ExecResult::Continue
+            ExecResult::Break
+        }
+
+        "cd" => {
+            // Ubah direktori kerja sesi REPL secara in-process.
+            // Jika tidak ada argumen, pindah ke home directory.
+            let target = tokens.get(1).map(|s| s.as_str()).unwrap_or(home);
+            let target = if target == "~" { home } else { target };
+
+            match env::set_current_dir(target) {
+                Ok(_) => ExecResult::Continue,
+                Err(e) => ExecResult::Error(format!("{}cd: {}{}", RED, e, RESET)),
+            }
+        }
+
+        // ── Subcommand melisa ────────────────────────────────────────────────
+        "melisa" => dispatch_melisa_subcommand(&tokens, is_audit_mode, user, home).await,
+
+        // ── Bash passthrough ─────────────────────────────────────────────────
+        //
+        // FIX: Perintah apapun yang tidak dikenali oleh REPL diteruskan ke
+        // bash, persis seperti versi lama. Ini memungkinkan user menjalankan
+        // tool sistem (git, vim, python3, dll.) langsung dari dalam shell MELISA.
+        //
+        _ => {
+            // Tambahkan ~/.cargo/bin ke PATH agar binary Rust user tersedia.
+            let cargo_bin = format!("{}/.cargo/bin", home);
+            let path_env = format!(
+                "{}:{}",
+                cargo_bin,
+                env::var("PATH").unwrap_or_default()
+            );
+
+            let status = tokio::process::Command::new("bash")
+                .env("PATH", path_env)
+                .env("HOME", home)
+                .env("USER", user)
+                .envs([
+                    ("RUSTUP_HOME",    format!("{}/.rustup", home)),
+                    ("CARGO_HOME",     format!("{}/.cargo", home)),
+                    ("RUSTUP_TOOLCHAIN", "stable".into()),
+                ])
+                .args(["-c", input])
+                .status()
+                .await;
+
+            match status {
+                Ok(_) => ExecResult::Continue,
+                Err(e) => ExecResult::Error(format!("Bash Execution Error: {}", e)),
+            }
         }
     }
 }
@@ -474,6 +519,15 @@ async fn dispatch_melisa_subcommand(
             ExecResult::Continue
         }
 
+        // ── Subcommand kosong ────────────────────────────────────────────────
+        "" => {
+            println!(
+                "{}[ERROR]{} Incomplete command. Execute 'melisa --help' for usage.",
+                RED, RESET
+            );
+            ExecResult::Continue
+        }
+
         // ── Unknown sub-command ──────────────────────────────────────────────
         other => {
             println!(
@@ -701,8 +755,12 @@ async fn print_help(is_audit_mode: bool) {
         println!("  --update-all <proj>    Distribute master updates to all members");
     }
 
-    let _ = is_audit_mode; // used for future audit logging of help access
+    let _ = is_audit_mode;
     println!("\n{}Note: System modifications require SUID elevation.{}", BOLD, RESET);
+    println!("\n{}SHELL COMMANDS{}", BOLD, RESET);
+    println!("  exit / quit            Terminate the MELISA session");
+    println!("  cd <path>              Change working directory");
+    println!("  <any shell command>    Execute directly via bash");
 }
 
 // ============================================================================
@@ -781,5 +839,31 @@ mod tests {
             result.is_err(),
             "require_arg must return Err when the required argument is missing"
         );
+    }
+
+    // ── exit/quit/cd/bash routing ────────────────────────────────────────────
+
+    #[test]
+    fn test_exit_token_is_first_class_command() {
+        // Verify parse_command correctly tokenizes exit
+        let (tokens, _) = parse_command("exit");
+        assert_eq!(tokens[0], "exit");
+    }
+
+    #[test]
+    fn test_cd_token_is_first_class_command() {
+        let (tokens, _) = parse_command("cd /home/user");
+        assert_eq!(tokens[0], "cd");
+        assert_eq!(tokens[1], "/home/user");
+    }
+
+    #[test]
+    fn test_arbitrary_command_is_not_melisa() {
+        let (tokens, _) = parse_command("git status");
+        assert_ne!(tokens[0], "melisa");
+        assert_ne!(tokens[0], "exit");
+        assert_ne!(tokens[0], "cd");
+        // Verify it would fall into the bash passthrough branch
+        assert_eq!(tokens[0], "git");
     }
 }
