@@ -1,6 +1,7 @@
 // ============================================================================
 // src/core/container/network.rs
 //
+// Network configuration management for LXC containers.
 // LXC container network configuration:
 //   - Inject veth network config into the LXC config file.
 //   - Write and lock a container-local resolv.conf.
