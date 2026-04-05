@@ -109,7 +109,7 @@ fn get_pkg_manager_for_distro(distro_name: &str) -> &'static str {
     } else if name.contains("suse") || name.contains("opensuse") {
         "zypper"
     } else {
-        "apt" // sane default
+        "apt" // sane default for unknown distros
     }
 }
 
