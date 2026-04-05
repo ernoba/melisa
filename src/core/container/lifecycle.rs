@@ -19,7 +19,7 @@ use indicatif::ProgressBar;
 use chrono::Local;
 use crate::cli::color::{BOLD, GREEN, RED, RESET, YELLOW};
 use crate::core::container::network::{
-    ensure_host_network_ready, inject_network_config, setup_container_dns, unlock_container_dns,
+    ensure_host_network_ready, inject_network_config, setup_container_dns, unlock_container_dns, ensure_nat_routing_ready,
 };
 use crate::core::container::query::is_container_running;
 use crate::core::container::types::{LXC_BASE_PATH, DistroMetadata};
@@ -50,6 +50,10 @@ async fn run_sudo(args: &[&str], is_audit: bool) -> std::io::Result<std::process
 
 /// Returns true if the `lxcbr0` bridge is up; attempts an auto-repair if not.
 async fn verify_host_runtime(audit: bool) -> bool {
+    // Selalu pastikan NAT routing siap — rules ini ephemeral di OrbStack
+    // dan harus diterapkan ulang setiap sesi, tidak cukup sekali waktu setup
+    ensure_nat_routing_ready().await;
+
     if Path::new("/sys/class/net/lxcbr0").exists() {
         return true;
     }

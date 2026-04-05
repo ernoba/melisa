@@ -35,27 +35,32 @@ use crate::distros::host_distro::{detect_host_distro, get_distro_config, Firewal
 /// (OrbStack, VirtualBox, KVM, etc.) where `lxc-net` might be blocked by
 /// the systemd `ConditionVirtualization` guard.
 async fn is_virtualised_environment() -> bool {
-    // `systemd-detect-virt` exits with 0 when virtualisation is detected
-    // and prints the type (e.g. "microsoft", "oracle", "apple", "kvm").
-    // It exits non-zero (and prints "none") on bare metal.
-    let output = Command::new("systemd-detect-virt")
-        .output()
-        .await;
-
-    match output {
+    // Cek via systemd-detect-virt
+    let output = Command::new("systemd-detect-virt").output().await;
+    let detected_by_systemd = match output {
         Ok(out) => {
-            let virt_type = String::from_utf8_lossy(&out.stdout)
-                .trim()
-                .to_lowercase();
-            // "none" means bare metal — no override needed.
+            let virt_type = String::from_utf8_lossy(&out.stdout).trim().to_lowercase();
             out.status.success() && virt_type != "none" && !virt_type.is_empty()
         }
-        Err(_) => {
-            // systemd-detect-virt not available — check for common VM markers.
-            Path::new("/proc/vz").exists()          // OpenVZ
-                || Path::new("/.dockerenv").exists() // Docker (edge case)
-        }
+        Err(_) => false,
+    };
+
+    if detected_by_systemd {
+        return true;
     }
+
+    // BUG FIX #4: OrbStack menyembunyikan dirinya dari systemd-detect-virt.
+    // Fallback: deteksi lewat os-release, sama persis seperti detect_host_distro()
+    let os_release = tokio::fs::read_to_string("/etc/os-release")
+        .await
+        .unwrap_or_default()
+        .to_lowercase();
+    if os_release.contains("orbstack") {
+        return true;
+    }
+
+    // Fallback lama
+    Path::new("/proc/vz").exists() || Path::new("/.dockerenv").exists()
 }
 
 /// Applies the systemd override that allows `lxc-net` to start inside a VM.
@@ -243,11 +248,12 @@ pub async fn ensure_host_network_ready(audit: bool) {
 
     // ── OrbStack / VM compatibility ──────────────────────────────────────────
     if is_virtualised_environment().await {
+        apply_orbstack_lxcnet_override(audit).await;
         println!(
             "{}[INFO]{} Virtualisation detected (OrbStack/VM). Applying lxc-net override…",
             YELLOW, RESET
         );
-        apply_orbstack_lxcnet_override(audit).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
     } else {
         // Standard bare-metal: just start lxc-net directly.
         let lxc_net_args: &[&str] = &["-n", "systemctl", "start", "lxc-net"];
@@ -264,7 +270,7 @@ pub async fn ensure_host_network_ready(audit: bool) {
     }
 
     // ── Firewall rules ───────────────────────────────────────────────────────
-    let host_distro  = detect_host_distro().await;
+    let host_distro = detect_host_distro().await;
     let distro_config = get_distro_config(&host_distro);
     configure_firewall_for_lxc(&distro_config.firewall_tool).await;
 }
@@ -380,6 +386,71 @@ pub async fn setup_container_dns(name: &str, pb: &ProgressBar) {
         _ => {
             eprintln!("{}[ERROR]{} Failed to configure DNS for container '{}'.", RED, RESET, name);
         }
+    }
+}
+
+/// Pastikan host bisa meneruskan paket dari container ke internet.
+/// Dipanggil SETIAP kali container dibuat atau dijalankan — bukan hanya saat lxcbr0 down.
+/// Di OrbStack, iptables rules bersifat ephemeral dan hilang setiap VM restart.
+pub async fn ensure_nat_routing_ready() {
+    // 1. Aktifkan ip_forward agar kernel mau forward paket antar-interface
+    let _ = Command::new("sudo")
+        .args(&["-n", "sysctl", "-w", "net.ipv4.ip_forward=1"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+
+    // 2. Cek dulu apakah MASQUERADE rule sudah ada (hindari duplikat)
+    let check = Command::new("sudo")
+        .args(&[
+            "-n", "iptables", "-t", "nat", "-C", "POSTROUTING",
+            "-s", "10.0.3.0/24", "!", "-d", "10.0.3.0/24", "-j", "MASQUERADE",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+
+    // Exit code != 0 artinya rule belum ada
+    if check.map(|s| !s.success()).unwrap_or(true) {
+        let _ = Command::new("sudo")
+            .args(&[
+                "-n", "iptables", "-t", "nat", "-A", "POSTROUTING",
+                "-s", "10.0.3.0/24", "!", "-d", "10.0.3.0/24", "-j", "MASQUERADE",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+    }
+
+    // 3. Izinkan FORWARD dari container keluar (cek dulu agar tidak duplikat)
+    let fwd_check = Command::new("sudo")
+        .args(&["-n", "iptables", "-C", "FORWARD", "-i", "lxcbr0", "-j", "ACCEPT"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+
+    if fwd_check.map(|s| !s.success()).unwrap_or(true) {
+        let _ = Command::new("sudo")
+            .args(&["-n", "iptables", "-I", "FORWARD", "-i", "lxcbr0", "-j", "ACCEPT"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+        // Paket balasan masuk ke container
+        let _ = Command::new("sudo")
+            .args(&[
+                "-n", "iptables", "-I", "FORWARD",
+                "-o", "lxcbr0", "-m", "state",
+                "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
     }
 }
 
@@ -512,10 +583,51 @@ async fn configure_firewall_for_lxc(firewall: &FirewallKind) {
                 .await;
         }
         FirewallKind::Iptables => {
-            let _ = Command::new("sudo")
-                .args(&["-n", "iptables", "-I", "INPUT", "-i", "lxcbr0", "-j", "ACCEPT"])
-                .status()
-                .await;
+        // BUG FIX #2: Aktifkan ip_forward agar kernel mau forward paket antar-interface
+        let _ = Command::new("sudo")
+            .args(&["-n", "sysctl", "-w", "net.ipv4.ip_forward=1"])
+            .status().await;
+
+        // Buat permanen antar reboot
+        let _ = Command::new("sudo")
+            .args(&["-n", "bash", "-c",
+                "grep -q 'net.ipv4.ip_forward' /etc/sysctl.conf \
+                && sed -i 's/.*net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf \
+                || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf"])
+            .status().await;
+
+        // INPUT — izinkan host terima paket dari container (sudah ada, tetap dipertahankan)
+        let _ = Command::new("sudo")
+            .args(&["-n", "iptables", "-I", "INPUT", "-i", "lxcbr0", "-j", "ACCEPT"])
+            .status().await;
+
+        // BUG FIX #3: FORWARD chain — izinkan kernel forward paket dari container keluar
+        let _ = Command::new("sudo")
+            .args(&["-n", "iptables", "-I", "FORWARD", "-i", "lxcbr0", "-j", "ACCEPT"])
+            .status().await;
+
+        // BUG FIX #3: FORWARD chain — izinkan paket balasan masuk kembali ke container
+        let _ = Command::new("sudo")
+            .args(&["-n", "iptables", "-I", "FORWARD",
+                "-o", "lxcbr0", "-m", "state",
+                "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"])
+            .status().await;
+
+        // BUG FIX #1: NAT MASQUERADE — sembunyikan IP container di balik IP host
+        // Tanpa ini, paket dari 10.0.3.x tidak akan di-route oleh internet
+        let _ = Command::new("sudo")
+            .args(&["-n", "iptables", "-t", "nat", "-C", "POSTROUTING",
+                "-s", "10.0.3.0/24", "!", "-d", "10.0.3.0/24", "-j", "MASQUERADE"])
+            .status().await
+            .map(|s| {
+                if !s.success() {
+                    // Rule belum ada, tambahkan
+                    tokio::spawn(Command::new("sudo")
+                        .args(&["-n", "iptables", "-t", "nat", "-A", "POSTROUTING",
+                            "-s", "10.0.3.0/24", "!", "-d", "10.0.3.0/24", "-j", "MASQUERADE"])
+                        .status());
+                }
+            });
         }
     }
 }

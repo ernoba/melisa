@@ -16,6 +16,7 @@ pub use lifecycle::{create_container, delete_container, start_container, stop_co
 pub use network::{
     add_shared_folder, remove_shared_folder, ensure_host_network_ready,
     inject_network_config, setup_container_dns, unlock_container_dns,
+    ensure_nat_routing_ready,  
 };
 pub use query::{
     list_containers, get_container_ip, is_container_running,
