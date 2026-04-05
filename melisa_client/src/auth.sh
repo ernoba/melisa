@@ -40,7 +40,7 @@ get_active_conn() {
     local entry
     entry=$(grep "^${active}=" "$PROFILE_FILE" | cut -d'=' -f2)
 
-    # ✅ FIX: Strip the "|melisa_user" suffix — return ONLY the "user@host" part
+    # FIX: Strip the "|melisa_user" suffix — return ONLY the "user@host" part
     local conn
     conn=$(echo "$entry" | cut -d'|' -f1)
 
@@ -135,7 +135,7 @@ EOF
     fi
 
     # Prompt for the MELISA application username on the remote server.
-    # This may differ from the SSH login user (e.g., SSH as root but MELISA user is "afira").
+    # This may differ from the SSH login user (e.g., SSH as root but MELISA user is "melisa").
     local melisa_user
     read -rp "$(echo -e "[SETUP] Enter your MELISA username on this server (leave blank if same as SSH user): ")" melisa_user
 
@@ -144,7 +144,7 @@ EOF
         melisa_user="$ssh_user"
     fi
 
-    # ✅ Store the profile as: name=user@host|melisa_user
+    # Store the profile as: name=user@host|melisa_user
     # This keeps SSH connection and MELISA identity cleanly separated.
     if [ -f "$PROFILE_FILE" ]; then
         grep -v "^${name}=" "$PROFILE_FILE" > "${PROFILE_FILE}.tmp"
@@ -222,7 +222,7 @@ auth_list() {
     while IFS='=' read -r name stored_val; do
         if [ -z "$name" ]; then continue; fi
 
-        # ✅ Parse the stored "user@host|melisa_user" format for clean display
+        # Parse the stored "user@host|melisa_user" format for clean display
         local conn melisa_user
         conn=$(echo "$stored_val" | cut -d'|' -f1)
         melisa_user=$(echo "$stored_val" | cut -d'|' -f2)
