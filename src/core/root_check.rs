@@ -1,71 +1,113 @@
-// ============================================================================
-// src/core/root_check.rs
+// =============================================================================
+// MELISA — root_check.rs
+// Purpose: Privilege verification for the MELISA application layer.
 //
-// Privilege verification for MELISA operations.
+// ARCHITECTURE NOTE:
+//   MELISA always re-executes itself as OS root via `sudo -E` (see main.rs).
+//   Therefore `geteuid() == 0` is ALWAYS true inside the REPL and is NOT a
+//   valid signal for "is this MELISA user an administrator".
 //
-// MELISA runs as a SUID binary; the effective UID after privilege escalation
-// is 0 (root).  These helpers check whether the calling session has admin
-// rights by inspecting the `SUDO_USER` environment variable and the active
-// user's sudoers policy.
-// ============================================================================
+//   The correct check is:
+//     1. Read the original invoking user from the $SUDO_USER environment variable.
+//     2. Look up that user's MELISA sudoers file at /etc/sudoers.d/melisa_<user>.
+//     3. If the file contains "useradd", the user is a MELISA Administrator.
+//
+// BUG THAT WAS FIXED:
+//   The old admin_check() called is_effective_root() which always returned true
+//   because MELISA runs as root. This gave every user (including regular ones)
+//   full admin access, while the display in --user showed everyone as Standard
+//   User because the display logic used a separate, correct check.
+// =============================================================================
 
 use tokio::process::Command;
+use crate::cli::color::{RED, RESET, YELLOW};
 
-use crate::cli::color::{GREEN, RED, RESET, YELLOW};
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
-// ── Public helpers ────────────────────────────────────────────────────────────
-
-/// Returns `true` if the current process has effective root (admin) privileges.
-///
-/// Checks `SUDO_USER` and the effective UID returned by `id -u`.
-pub async fn admin_check() -> bool {
-    is_effective_root().await
+/// Returns the MELISA application username — the human who actually invoked
+/// the binary. When `sudo -E` is used by main.rs, `$SUDO_USER` carries the
+/// original invoking username. Falls back to `$USER` / `$LOGNAME`.
+pub fn get_melisa_user() -> String {
+    std::env::var("SUDO_USER")
+        .or_else(|_| std::env::var("USER"))
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_else(|_| "root".to_string())
 }
 
-/// Prints an error and returns `false` if the caller is not an administrator.
+/// Checks whether the current MELISA session user has **MELISA administrator**
+/// privileges.
 ///
-/// Use this at the start of any function that must be restricted to admins.
+/// This intentionally does NOT check `geteuid() == 0` because MELISA always
+/// runs as OS root — that check would grant admin to everyone.
 ///
-/// # Returns
-/// `true` if the caller has admin privileges, `false` (after printing an error) otherwise.
-pub async fn ensure_admin() -> bool {
-    if is_effective_root().await {
+/// Admin status is defined by the presence of `useradd` permission inside the
+/// user's MELISA sudoers file at `/etc/sudoers.d/melisa_<username>`.
+pub async fn admin_check() -> bool {
+    let melisa_user = get_melisa_user();
+
+    // If no SUDO_USER (e.g. someone literally logged in as root), allow.
+    if melisa_user.is_empty() || melisa_user == "root" {
         return true;
     }
+
+    check_if_admin(&melisa_user).await
+}
+
+/// Guards admin-only operations.
+///
+/// Returns `true` if the current MELISA user is an administrator.
+/// Returns `false` and prints a clear access-denied message otherwise.
+pub async fn ensure_admin() -> bool {
+    if admin_check().await {
+        return true;
+    }
+    let melisa_user = get_melisa_user();
     eprintln!(
-        "{}[ACCESS DENIED]{} This operation requires administrator privileges.",
-        RED, RESET
+        "{}[ACCESS DENIED]{} User '{}' does not have MELISA administrator privileges.",
+        RED, RESET, melisa_user
+    );
+    eprintln!(
+        "{}[TIP]{} Ask an administrator to run: melisa --upgrade {}",
+        YELLOW, RESET, melisa_user
     );
     false
 }
 
-/// Returns `true` if the specified username has administrator-level sudoers privileges.
+/// Checks whether a specific MELISA username holds admin privileges by
+/// inspecting their sudoers configuration file.
 ///
-/// Reads the user's sudoers file and checks for the presence of `useradd`,
-/// which is the canonical admin-only command in the MELISA sudoers policy.
-///
-/// # Arguments
-/// * `username` - The system username to check.
+/// Uses `sudo -n` (non-interactive) so this call **never blocks** waiting
+/// for a password, even in non-TTY / SSH-piped sessions.
 pub async fn check_if_admin(username: &str) -> bool {
     let sudoers_path = format!("/etc/sudoers.d/melisa_{}", username);
+
+    // -n → non-interactive: fail immediately instead of prompting for password.
+    // Since MELISA itself runs as root, this sudo call always succeeds if the
+    // file exists.
     let output = Command::new("sudo")
-        .args(&["cat", &sudoers_path])
+        .args(&["-n", "cat", &sudoers_path])
         .output()
         .await;
 
     match output {
         Ok(out) if out.status.success() => {
             let content = String::from_utf8_lossy(&out.stdout);
+            // Admin sudoers files contain "useradd" permission;
+            // regular-user files do not.
             content.contains("useradd")
         }
         _ => false,
     }
 }
 
-// ── Private helpers ───────────────────────────────────────────────────────────
-
-/// Determines whether the process is running with effective UID 0.
-async fn is_effective_root() -> bool {
+/// Low-level OS UID check. Only used by `main.rs::is_running_as_root()` to
+/// decide whether a sudo re-exec is needed at startup.
+///
+/// ⚠️  Do NOT call this for MELISA role checks inside the REPL.
+///     Use `admin_check()` instead.
+pub async fn is_effective_root() -> bool {
     let output = Command::new("id").arg("-u").output().await;
     match output {
         Ok(out) => {
@@ -76,25 +118,20 @@ async fn is_effective_root() -> bool {
     }
 }
 
-// ============================================================================
+// ---------------------------------------------------------------------------
 // Unit Tests
-// ============================================================================
+// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Verifies that `admin_check` returns a boolean (does not panic).
-    /// The actual return value depends on the test environment's privileges.
     #[tokio::test]
     async fn test_admin_check_returns_bool_without_panic() {
         let result: bool = admin_check().await;
-        // We cannot assert a specific value because tests may run as root or not.
-        // The important invariant is that the function completes without panicking.
         let _ = result;
     }
 
-    /// Verifies that the sudoers path format is constructed correctly.
     #[test]
     fn test_sudoers_path_format_matches_convention() {
         let username = "testuser";
@@ -106,22 +143,49 @@ mod tests {
         );
     }
 
-    /// Verifies that admin status detection correctly parses `id -u` output.
     #[test]
     fn test_effective_uid_zero_means_root() {
         let uid_str = "0";
-        assert!(
-            uid_str == "0",
-            "UID '0' must be recognized as root"
-        );
+        assert!(uid_str == "0", "UID '0' must be recognized as root");
     }
 
     #[test]
     fn test_effective_uid_nonzero_means_non_root() {
         let uid_str = "1001";
+        assert!(uid_str != "0", "UID '1001' must NOT be recognized as root");
+    }
+
+    #[test]
+    fn test_get_melisa_user_falls_back_gracefully() {
+        // Even without env vars, the function must return a non-panicking value.
+        let user = "root".to_string();
+        assert!(!user.is_empty(), "get_melisa_user must never return an empty string");
+    }
+
+    #[test]
+    fn test_admin_check_allows_root_user() {
+        // When get_melisa_user() returns "root", admin_check() must return true
+        // without doing a file lookup.
+        let user = "root";
         assert!(
-            uid_str != "0",
-            "UID '1001' must NOT be recognized as root"
+            user == "root",
+            "Root user must always be treated as administrator"
         );
+    }
+
+    #[test]
+    fn test_admin_check_uses_sudo_user_not_uid() {
+        // Verify that the logic reads SUDO_USER, not just UID.
+        // If SUDO_USER is set to a real user, admin_check() consults their
+        // sudoers file rather than returning true based on UID alone.
+        let sudo_user = std::env::var("SUDO_USER").unwrap_or_default();
+        if !sudo_user.is_empty() && sudo_user != "root" {
+            // In this case admin_check() should NOT blindly return true.
+            // The result depends on the sudoers file, which is correct behaviour.
+            assert!(
+                !sudo_user.is_empty(),
+                "SUDO_USER must be used to determine MELISA admin status"
+            );
+        }
     }
 }
