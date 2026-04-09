@@ -23,9 +23,7 @@ use std::env;
 use crate::cli::color::{RED, GREEN, YELLOW, BOLD, RESET};
 use crate::cli::loading::execute_with_spinner;
 use crate::core::container::{
-    create_container, delete_container, start_container, stop_container,
-    attach_to_container, send_command, get_container_ip, list_containers,
-    upload_to_container, add_shared_folder, remove_shared_folder,
+    add_shared_folder, attach_to_container, container_exists, create_container, delete_container, get_container_ip, list_containers, remove_shared_folder, send_command, start_container, stop_container, upload_to_container
 };
 use crate::core::metadata::{print_about, inspect_container_metadata, MelisaError};
 use crate::core::root_check::admin_check;
@@ -248,6 +246,15 @@ async fn dispatch_melisa_subcommand(
 
         "--delete" => {
             let name = req!(require_arg(tokens, 2, "melisa --delete <n>"));
+            // Destructive action confirmation prompt
+            if container_exists(name).await == false {
+                println!(
+                    "{}[ERROR]{} Container '{}' does not exist.",
+                    RED, RESET, name
+                );
+                return ExecResult::Continue;
+            }
+            
             if confirm_destructive_action(&format!("permanently delete container '{}'", name)).await {
                 execute_with_spinner(
                     &format!("Destroying container '{}'...", name),

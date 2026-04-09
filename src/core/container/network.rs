@@ -17,7 +17,7 @@
 //     5. Reports a non-fatal warning if chattr fails (VirtIO-FS limitation).
 // =============================================================================
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
@@ -463,91 +463,128 @@ pub async fn unlock_container_dns(name: &str) {
         .await;
 }
 
-/// Mounts a host directory into a container via an LXC bind-mount entry.
-pub async fn add_shared_folder(container_name: &str, host_path: &str, container_path: &str) {
-    let config_path = format!("{}/{}/config", LXC_BASE_PATH, container_name);
-    let bind_entry  = format!(
-        "lxc.mount.entry = {} {} none bind,create=dir 0 0\n",
-        host_path, container_path
-    );
+/// Fungsi pembantu untuk mendapatkan absolute path secara cerdas.
+/// Jika folder tidak ada, akan dibuat di direktori saat ini (CWD).
+async fn resolve_and_prepare_host_path(path_input: &str) -> Result<String, String> {
+    let mut path = PathBuf::from(path_input);
 
-    let chown_status = Command::new("sudo")
-        .args(&["chown", "-R", "100000:100000", host_path])
-        .status()
-        .await;
-
-    match chown_status {
-        Ok(s) if s.success() => {
-            println!(
-                "{}[INFO]{} Ownership of '{}' mapped to 100000:100000.",
-                BOLD, RESET, host_path
-            );
-        }
-        _ => {
-            eprintln!(
-                "{}[WARNING]{} Failed to remap ownership of '{}'. \
-                The shared folder may not be accessible inside the container.",
-                YELLOW, RESET, host_path
-            );
-        }
+    // 1. Jika jalur tidak absolut, gabungkan dengan current working directory
+    if !path.is_absolute() {
+        let cwd = std::env::current_dir().map_err(|e| format!("Gagal akses CWD: {}", e))?;
+        path = cwd.join(path);
     }
 
-    match OpenOptions::new().append(true).open(&config_path).await {
-        Ok(mut file) => {
-            if let Err(err) = file.write_all(bind_entry.as_bytes()).await {
-                eprintln!(
-                    "{}[ERROR]{} Failed to write bind-mount entry: {}",
-                    RED, RESET, err
-                );
-            } else {
-                println!(
-                    "{}[SUCCESS]{} Shared folder '{}' → '{}' configured.",
-                    GREEN, RESET, host_path, container_path
-                );
-            }
-        }
-        Err(err) => {
-            eprintln!(
-                "{}[ERROR]{} Failed to open LXC config file '{}': {}",
-                RED, RESET, config_path, err
-            );
-        }
+    // 2. Cek apakah folder ada, jika tidak ada buat foldernya
+    if !path.exists() {
+        fs::create_dir_all(&path)
+            .await
+            .map_err(|e| format!("Gagal membuat folder baru: {}", e))?;
+        println!("{}[INFO]{} Folder '{}' tidak ditemukan, otomatis dibuat.", BOLD, RESET, path.display());
     }
+
+    // 3. Ambil jalur lengkap (canonicalize) untuk memastikan tidak ada '../' atau simbolik link
+    let absolute_path = fs::canonicalize(&path)
+        .await
+        .map_err(|e| format!("Gagal verifikasi path: {}", e))?;
+
+    Ok(absolute_path.to_string_lossy().to_string())
 }
 
-/// Removes a bind-mount entry from a container's LXC config.
-pub async fn remove_shared_folder(container_name: &str, host_path: &str, container_path: &str) {
-    let config_path  = format!("{}/{}/config", LXC_BASE_PATH, container_name);
-    let target_entry = format!(
+/// Mounts a host directory into a container with smart path detection and auto-create.
+pub async fn add_shared_folder(container_name: &str, host_path_input: &str, container_path: &str) {
+    // Langkah 1: Resolusi Path (Pintar)
+    let host_path = match resolve_and_prepare_host_path(host_path_input).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{}[ERROR]{} {}", RED, RESET, e);
+            return;
+        }
+    };
+
+    let config_path = format!("{}/{}/config", LXC_BASE_PATH, container_name);
+    let bind_entry = format!(
         "lxc.mount.entry = {} {} none bind,create=dir 0 0",
         host_path, container_path
     );
 
-    match fs::read_to_string(&config_path).await {
-        Ok(content) => {
-            let updated_content: String = content
-                .lines()
-                .filter(|line| !line.trim().eq(target_entry.trim()))
-                .map(|line| format!("{}\n", line))
-                .collect();
-            if let Err(err) = fs::write(&config_path, updated_content).await {
-                eprintln!(
-                    "{}[ERROR]{} Failed to update LXC config file: {}",
-                    RED, RESET, err
-                );
+    // Langkah 2: Idempotency (Cek apakah sudah ada agar tidak duplikat)
+    if let Ok(content) = fs::read_to_string(&config_path).await {
+        if content.contains(&bind_entry) {
+            println!("{}[INFO]{} Konfigurasi folder sudah ada. Skip.", BOLD, RESET);
+            return;
+        }
+    }
+
+    // Langkah 3: Perbaiki Ownership (untuk unprivileged container)
+    let chown_status = Command::new("sudo")
+        .args(&["chown", "-R", "100000:100000", &host_path])
+        .status()
+        .await;
+
+    if let Err(e) = chown_status {
+        eprintln!("{}[WARNING]{} Gagal menjalankan chown: {}", YELLOW, RESET, e);
+    }
+
+    // Langkah 4: Tulis ke config
+    match OpenOptions::new().append(true).open(&config_path).await {
+        Ok(mut file) => {
+            if let Err(err) = file.write_all(format!("{}\n", bind_entry).as_bytes()).await {
+                eprintln!("{}[ERROR]{} Gagal menulis config: {}", RED, RESET, err);
             } else {
                 println!(
-                    "{}[SUCCESS]{} Shared folder '{}' → '{}' removed from config.",
+                    "{}[SUCCESS]{} Shared folder '{}' -> '{}' aktif.",
                     GREEN, RESET, host_path, container_path
                 );
             }
         }
-        Err(err) => {
-            eprintln!(
-                "{}[ERROR]{} Cannot read LXC config file '{}': {}",
-                RED, RESET, config_path, err
-            );
+        Err(err) => eprintln!("{}[ERROR]{} Tidak bisa buka config: {}", RED, RESET, err),
+    }
+}
+
+/// Removes a bind-mount entry dengan pencocokan yang lebih fleksibel.
+pub async fn remove_shared_folder(container_name: &str, host_path_input: &str, container_path: &str) {
+    let config_path = format!("{}/{}/config", LXC_BASE_PATH, container_name);
+    
+    // Resolve path input dulu supaya pencocokan string di config akurat
+    let host_path = Path::new(host_path_input);
+    let host_path_str = if host_path.is_absolute() {
+        host_path_input.to_string()
+    } else {
+        match std::env::current_dir() {
+            Ok(cwd) => cwd.join(host_path).to_string_lossy().to_string(),
+            Err(_) => host_path_input.to_string(),
         }
+    };
+
+    match fs::read_to_string(&config_path).await {
+        Ok(content) => {
+            let lines: Vec<&str> = content.lines().collect();
+            let mut new_lines = Vec::new();
+            let mut found = false;
+
+            for line in lines {
+                // Mencocokkan entri secara pintar (mengabaikan spasi berlebih)
+                if line.contains("lxc.mount.entry") && line.contains(&host_path_str) && line.contains(container_path) {
+                    found = true;
+                    continue; // Skip baris ini (hapus)
+                }
+                new_lines.push(line);
+            }
+
+            if found {
+                let mut updated_content = new_lines.join("\n");
+                updated_content.push('\n');
+
+                if let Err(err) = fs::write(&config_path, updated_content).await {
+                    eprintln!("{}[ERROR]{} Gagal update config: {}", RED, RESET, err);
+                } else {
+                    println!("{}[SUCCESS]{} Folder '{}' dihapus dari config.", GREEN, RESET, host_path_str);
+                }
+            } else {
+                println!("{}[INFO]{} Entri tidak ditemukan di config.", BOLD, RESET);
+            }
+        }
+        Err(err) => eprintln!("{}[ERROR]{} Gagal baca config: {}", RED, RESET, err),
     }
 }
 
