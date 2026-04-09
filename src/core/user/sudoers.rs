@@ -94,7 +94,7 @@ pub fn sudoers_file_path(username: &str) -> String {
 ///
 /// Uses `sudo tee` so the write is done as root; permissions are then locked
 /// to 0440 (read-only, root-owned) as required by sudoers policy.
-pub async fn configure_sudoers(username: &str, role: UserRole, audit: bool) {
+pub async fn configure_sudoers(username: &str, role: &UserRole, audit: bool) {
     let sudoers_rule = build_sudoers_rule(username, &role);
     let sudoers_path = sudoers_file_path(username);
 
@@ -123,8 +123,8 @@ pub async fn configure_sudoers(username: &str, role: UserRole, audit: bool) {
             let _ = child.wait().await;
 
             // Lock to 0440 — required by visudo/sudoers policy
-            let _ = Command::new("sudo")
-                .args(&["chmod", "0440", &sudoers_path])
+            let _ = Command::new("/usr/bin/chmod") // Gunakan path absolut untuk keamanan
+                .args(&["0440", &sudoers_path])
                 .status()
                 .await;
 
@@ -157,21 +157,10 @@ pub async fn configure_sudoers(username: &str, role: UserRole, audit: bool) {
 /// → every user was shown as [STANDARD USER] regardless of actual role.
 pub async fn check_if_admin(username: &str) -> bool {
     let sudoers_path = sudoers_file_path(username);
-
-    // -n = non-interactive: fail immediately if password would be required.
-    // MELISA runs as OS root at this point, so the call should always succeed
-    // if the file exists.
-    let output = Command::new("sudo")
-        .args(&["-n", "cat", &sudoers_path])
-        .output()
-        .await;
-
-    match output {
-        Ok(out) if out.status.success() => {
-            let content = String::from_utf8_lossy(&out.stdout);
-            content.contains("useradd")
-        }
-        _ => false,
+    // MELISA berjalan sebagai root — baca langsung tanpa sudo
+    match tokio::fs::read_to_string(&sudoers_path).await {
+        Ok(content) => content.contains("useradd"),
+        Err(_) => false,
     }
 }
 

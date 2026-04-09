@@ -94,8 +94,30 @@ pub async fn add_melisa_user(username: &str, audit: bool) {
 
             // Set initial password; if it fails, do not deploy sudoers.
             if set_user_password(username).await {
-                configure_sudoers(username, role, audit).await;
+                configure_sudoers(username, &role, audit).await;
+
+                // Tambahkan logika ini di dalam fungsi add_melisa_user dan upgrade_user
+                // tepat setelah pemanggilan configure_sudoers()
+
+                if role == UserRole::Admin {
+                    // Deteksi grup yang tersedia (sudo atau wheel)
+                    let group = if Command::new("getent").arg("group").arg("sudo").output().await.map_or(false, |o| o.status.success()) {
+                        "sudo"
+                    } else {
+                        "wheel"
+                    };
+
+                    if audit {
+                        println!("[AUDIT] Adding user '{}' to system group '{}'", username, group);
+                    }
+
+                    let _ = Command::new("sudo")
+                        .args(&["usermod", "-aG", group, username])
+                        .status()
+                        .await;
+                }
             }
+            
         }
         _ => {
             eprintln!(
@@ -232,6 +254,29 @@ pub async fn list_melisa_users() {
     println!("\n{}--- Registered MELISA Accounts ---{}", BOLD, RESET);
 
     let mut existing_usernames: Vec<String> = Vec::new();
+
+    // 1. Tambahkan user saat ini (via sudo)
+    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        existing_usernames.push(sudo_user);
+    }
+
+    // 2. Tambahkan SEMUA user yang punya file di /etc/sudoers.d/melisa_*
+    // Ini menjamin user host seperti 'saferoom' tidak dianggap orphan
+    let files = Command::new("ls").arg("/etc/sudoers.d/").output().await;
+    if let Ok(out) = files {
+        let list = String::from_utf8_lossy(&out.stdout);
+        for line in list.lines() {
+            if line.starts_with("melisa_") {
+                let u = line.trim_start_matches("melisa_");
+                // Cek apakah user benar-benar ada di sistem OS
+                if Command::new("id").arg(u).status().await.map_or(false, |s| s.success()) {
+                    if !existing_usernames.contains(&u.to_string()) {
+                        existing_usernames.push(u.to_string());
+                    }
+                }
+            }
+        }
+    }
 
     // 1. Daftarkan Host User (Admin Utama OS) terlebih dahulu agar tidak dianggap orphan
     if let Ok(sudo_user) = std::env::var("SUDO_USER") {
@@ -374,7 +419,28 @@ pub async fn upgrade_user(username: &str, audit: bool) {
         _ => UserRole::Regular,
     };
 
-    configure_sudoers(username, role, audit).await;
+    configure_sudoers(username, &role, audit).await;
+
+    // Tambahkan logika ini di dalam fungsi add_melisa_user dan upgrade_user
+    // tepat setelah pemanggilan configure_sudoers()
+
+    if role == UserRole::Admin {
+        // Deteksi grup yang tersedia (sudo atau wheel)
+        let group = if Command::new("getent").arg("group").arg("sudo").output().await.map_or(false, |o| o.status.success()) {
+            "sudo"
+        } else {
+            "wheel"
+        };
+
+        if audit {
+            println!("[AUDIT] Adding user '{}' to system group '{}'", username, group);
+        }
+
+        let _ = Command::new("sudo")
+            .args(&["usermod", "-aG", group, username])
+            .status()
+            .await;
+    }
 
     let success_msg = format!(
         "{}[DONE]{} Privileges for '{}' updated successfully.\n",
@@ -401,6 +467,29 @@ pub async fn clean_orphaned_sudoers() {
     );
 
     let mut existing_usernames: Vec<String> = Vec::new();
+
+    // 1. Tambahkan user saat ini (via sudo)
+    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
+        existing_usernames.push(sudo_user);
+    }
+
+    // 2. Tambahkan SEMUA user yang punya file di /etc/sudoers.d/melisa_*
+    // Ini menjamin user host seperti 'saferoom' tidak dianggap orphan
+    let files = Command::new("ls").arg("/etc/sudoers.d/").output().await;
+    if let Ok(out) = files {
+        let list = String::from_utf8_lossy(&out.stdout);
+        for line in list.lines() {
+            if line.starts_with("melisa_") {
+                let u = line.trim_start_matches("melisa_");
+                // Cek apakah user benar-benar ada di sistem OS
+                if Command::new("id").arg(u).status().await.map_or(false, |s| s.success()) {
+                    if !existing_usernames.contains(&u.to_string()) {
+                        existing_usernames.push(u.to_string());
+                    }
+                }
+            }
+        }
+    }
 
     // Lindungi Host User
     if let Ok(sudo_user) = std::env::var("SUDO_USER") {

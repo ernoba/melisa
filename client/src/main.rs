@@ -184,25 +184,25 @@ fn print_help() {
     println!("{BOLD}Usage:{RESET} melisa <command> [arguments]\n");
 
     println!("{BOLD}AUTHENTICATION & CONNECTIONS:{RESET}");
-    println!("  auth add <n> <user@ip>  : Register a new remote MELISA server");
-    println!("  auth switch <n>         : Switch active session to another server");
-    println!("  auth list               : Display all registered remote servers");
-    println!("  auth remove <n>         : Unregister and delete a remote server");
-
+    println!("  auth add <n> <user@ip>           : Register a new remote MELISA server");
+    println!("  auth switch <n>                  : Switch active session to another server");
+    println!("  auth list                        : Display all registered remote servers");
+    println!("  auth remove <n>                  : Unregister and delete a remote server");
+ 
     println!("\n{BOLD}PROJECT SYNCHRONISATION:{RESET}");
-    println!("  clone <n> [--force]     : Clone a project workspace from the host");
-    println!("  sync  <n>               : Push local workspace modifications to the host");
-    println!("  get   <n> [--force]     : Pull the latest master data into local workspace");
+    println!("  clone <n> [--force]              : Clone a project workspace from the host");
+    println!("  sync  <n>                        : Push local workspace modifications to the host");
+    println!("  get   <n> [--force]              : Pull the latest master data into local workspace");
 
     println!("\n{BOLD}REMOTE OPERATIONS:{RESET}");
-    println!("  run     <cont> <file>         : Execute a local script remotely (background)");
-    println!("  run-tty <cont> <file>         : Execute a script interactively (TTY)");
-    println!("  upload  <cont> <dir> <dst>    : Transfer a local directory into a container");
-    println!("  shell                         : Open a direct SSH shell to the MELISA host");
-    println!("  --list / --active             : Enumerate provisioned containers");
+    println!("  run     <cont> <file>            : Execute a local script remotely (background)");
+    println!("  run-tty <cont> <file>            : Execute a script interactively (TTY)");
+    println!("  upload  <cont> <dir> <dst>       : Transfer a local directory into a container");
+    println!("  shell                            : Open a direct SSH shell to the MELISA host");
+    println!("  --list / --active                : Enumerate provisioned containers");
 
     println!("\n{BOLD}TUNNEL & EXPOSE:{RESET}");
-    println!("  tunnel      <cont> <port> [lp]  : Forward container port to localhost");
+    println!("  tunnel      <cont> <port> [lp]   : Forward container port to localhost");
     println!("  tunnel-list                      : Show all active SSH tunnels");
     println!("  tunnel-stop <cont> [port]        : Stop a running tunnel");
 

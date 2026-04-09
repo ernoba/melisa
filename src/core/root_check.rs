@@ -81,24 +81,21 @@ pub async fn ensure_admin() -> bool {
 /// Uses `sudo -n` (non-interactive) so this call **never blocks** waiting
 /// for a password, even in non-TTY / SSH-piped sessions.
 pub async fn check_if_admin(username: &str) -> bool {
-    // 1. Check Sudoers MELISA
     let sudoers_path = format!("/etc/sudoers.d/melisa_{}", username);
-    let output = Command::new("sudo")
-        .args(&["-n", "cat", &sudoers_path])
-        .output()
-        .await;
 
-    if let Ok(out) = output {
-        if out.status.success() {
-            let content = String::from_utf8_lossy(&out.stdout);
-            if content.contains("useradd") {
-                return true;
-            }
+    // PERBAIKAN: Baca file secara langsung menggunakan tokio::fs.
+    // Karena MELISA sudah berjalan sebagai root (setelah re-exec), 
+    // ia memiliki izin penuh untuk membaca direktori /etc/sudoers.d/.
+    if let Ok(content) = tokio::fs::read_to_string(&sudoers_path).await {
+        // Logika internal MELISA: Jika file sudoers mengandung 'useradd', 
+        // berarti user ini adalah Administrator MELISA.
+        if content.contains("useradd") {
+            return true;
         }
     }
 
-    // 2. FALLBACK: Check Native Host Admin (sudo/wheel group)
-    let group_check = Command::new("id")
+    // FALLBACK: Cek apakah user ada di grup sudo/wheel sistem host
+    let group_check = tokio::process::Command::new("id")
         .arg("-nG")
         .arg(username)
         .output()
