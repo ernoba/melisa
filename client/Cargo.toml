@@ -1,0 +1,28 @@
+[package]
+name        = "melisa-client"
+version     = "0.1.0"
+edition     = "2024"
+authors     = ["Erick Adriano Sebastian"]
+license     = "MIT"
+description = "MELISA Client — cross-platform remote management CLI (Windows / macOS / Linux)"
+
+[[bin]]
+name = "melisa"
+path = "src/main.rs"
+ 
+[dependencies]
+# Terminal colour output — handles Windows ANSI enablement automatically
+colored = "2"
+ 
+# Cross-platform config / data / home directory resolution
+dirs = "5"
+ 
+[target.'cfg(unix)'.dependencies]
+# Required for process_is_alive / kill_process on macOS and Linux
+libc = "0.2"
+ 
+[profile.release]
+strip     = true
+opt-level = 3
+lto       = true
+ 

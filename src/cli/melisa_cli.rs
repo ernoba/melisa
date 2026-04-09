@@ -146,14 +146,23 @@ pub async fn melisa() {
         // waiting for user input.  This is unavoidable for terminal handling.
         match rl.readline(&prompt_str) {
             Ok(line) => {
-                let input = line.trim();
+            let input = line.trim();
+            if input.is_empty() {
+                continue;
+            }
 
-                // Skip blank lines without adding them to history.
-                if input.is_empty() {
-                    continue;
-                }
+            // ── Input security gate ──────────────────────────────────────────
+            if let crate::core::guard::FilterResult::Block(reason) =
+                crate::core::guard::filter_input(input)
+            {
+                eprintln!("{}[BLOCKED]{} {}", RED, RESET, reason);
+                let _ = rl.add_history_entry(input);
+                let _ = rl.append_history(&history_path);
+                continue;
+            }
+            // ────────────────────────────────────────────────────────────────
 
-                match execute_command(input, &p_info.user, &p_info.home).await {
+            match execute_command(input, &p_info.user, &p_info.home).await {
                     // ── History management ────────────────────────────────────
                     //
                     // History is managed per-result:
