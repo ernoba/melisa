@@ -94,7 +94,7 @@ pub async fn add_melisa_user(username: &str, audit: bool) {
 
             // Set initial password; if it fails, do not deploy sudoers.
             if set_user_password(username).await {
-                configure_sudoers(username, &role, audit).await;
+                configure_sudoers(username, role.clone(), audit).await;
 
                 // Tambahkan logika ini di dalam fungsi add_melisa_user dan upgrade_user
                 // tepat setelah pemanggilan configure_sudoers()
@@ -419,7 +419,7 @@ pub async fn upgrade_user(username: &str, audit: bool) {
         _ => UserRole::Regular,
     };
 
-    configure_sudoers(username, &role, audit).await;
+    configure_sudoers(username, role.clone(), audit).await;
 
     // Tambahkan logika ini di dalam fungsi add_melisa_user dan upgrade_user
     // tepat setelah pemanggilan configure_sudoers()

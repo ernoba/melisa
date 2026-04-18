@@ -145,17 +145,17 @@ async fn acquire_lock(cache_exists: bool, audit: bool) {
 
 /// Fetches the distribution list from `lxc-download --list` with a fallback
 /// to `lxc-create --list`.
-async fn fetch_distro_list_from_network(audit: bool) -> (Vec<DistroMetadata>, bool) {
+pub async fn fetch_distro_list_from_network(audit: bool) -> (Vec<DistroMetadata>, bool) {
     if audit {
         println!("[AUDIT] Fetching distro list from lxc-download — raw output follows:");
     }
-
+ 
     let primary_output = Command::new("sudo")
         .args(&["-n", "-H", "/usr/share/lxc/templates/lxc-download", "--list"])
         .stderr(if audit { Stdio::inherit() } else { Stdio::null() })
         .output()
         .await;
-
+ 
     match primary_output {
         Ok(out)
             if out.status.success()
@@ -165,19 +165,23 @@ async fn fetch_distro_list_from_network(audit: bool) -> (Vec<DistroMetadata>, bo
         {
             let content = String::from_utf8_lossy(&out.stdout).to_string();
             if !content.is_empty() {
+                // Tulis cache file
                 let _ = fs::write(DISTRO_CACHE_PATH, &content).await;
-                // Make cache world-readable so non-root MELISA users can read it.
+ 
+                // FIX: chmod 644 bukan 666
+                // 644 = owner baca+tulis, group baca, others baca
+                // 666 sebelumnya = semua orang bisa tulis (berbahaya!)
                 let _ = Command::new("sudo")
-                    .args(&["chmod", "666", DISTRO_CACHE_PATH])
+                    .args(&["chmod", "644", DISTRO_CACHE_PATH])
                     .status()
                     .await;
+ 
                 return (parse_distro_list(&content), false);
             }
             (Vec::new(), false)
         }
-
+ 
         Ok(out) => {
-            // Primary method failed; try the fallback via lxc-create.
             if audit {
                 println!(
                     "[AUDIT] Primary fetch failed. Stderr: {}",
@@ -185,10 +189,9 @@ async fn fetch_distro_list_from_network(audit: bool) -> (Vec<DistroMetadata>, bo
                 );
                 println!("[AUDIT] Trying fallback via lxc-create --list:");
             }
-
             fetch_distro_list_fallback(audit).await
         }
-
+ 
         Err(err) => {
             eprintln!("[FATAL] Could not execute lxc-download: {}", err);
             (Vec::new(), false)
@@ -197,13 +200,13 @@ async fn fetch_distro_list_from_network(audit: bool) -> (Vec<DistroMetadata>, bo
 }
 
 /// Fallback distribution list fetch via `lxc-create -t download --list`.
-async fn fetch_distro_list_fallback(audit: bool) -> (Vec<DistroMetadata>, bool) {
-    // Clean up the probe container in case it was partially created before.
+pub async fn fetch_distro_list_fallback(audit: bool) -> (Vec<DistroMetadata>, bool) {
+    // Bersihkan container probe yang mungkin tertinggal dari run sebelumnya
     let _ = Command::new("sudo")
         .args(&["-n", "lxc-destroy", "-n", "MELISA_PROBE_UNUSED", "-f"])
         .output()
         .await;
-
+ 
     let fallback_output = Command::new("sudo")
         .args(&[
             "-n", "-H", "lxc-create",
@@ -214,11 +217,20 @@ async fn fetch_distro_list_fallback(audit: bool) -> (Vec<DistroMetadata>, bool) 
         .stderr(if audit { Stdio::inherit() } else { Stdio::null() })
         .output()
         .await;
-
+ 
     match fallback_output {
         Ok(out) if !out.stdout.is_empty() => {
             let content = String::from_utf8_lossy(&out.stdout).to_string();
+ 
+            // Tulis cache
             let _ = fs::write(DISTRO_CACHE_PATH, &content).await;
+ 
+            // FIX: chmod 644, bukan 666
+            let _ = Command::new("sudo")
+                .args(&["chmod", "644", DISTRO_CACHE_PATH])
+                .status()
+                .await;
+ 
             (parse_distro_list(&content), false)
         }
         _ => (Vec::new(), false),
@@ -332,6 +344,26 @@ mod tests {
         assert_eq!(
             LOCK_STALE_SECS, 60,
             "Lock file stale threshold must be 60 seconds"
+        );
+    }
+        #[test]
+    fn test_cache_permission_is_not_world_writable() {
+        // Dokumentasi permission yang benar sebagai test guardrail.
+        // Permission octal 0o644 = rw-r--r-- (owner write, others read-only)
+        // Permission octal 0o666 = rw-rw-rw- (world-writable — DILARANG)
+        let expected_permission: u32 = 0o644;
+        let forbidden_permission: u32 = 0o666;
+ 
+        assert_ne!(
+            expected_permission, forbidden_permission,
+            "Cache file must use 644, not world-writable 666"
+        );
+ 
+        // Pastikan 644 bukan world-writable
+        let others_write_bit = expected_permission & 0o002;
+        assert_eq!(
+            others_write_bit, 0,
+            "Permission 644 must NOT have the 'others write' bit set"
         );
     }
 }

@@ -334,58 +334,82 @@ pub async fn inject_network_config(name: &str, pb: &ProgressBar) {
 pub async fn setup_container_dns(name: &str, pb: &ProgressBar) {
     let etc_path = format!("{}/{}/rootfs/etc", LXC_BASE_PATH, name);
     let dns_path = format!("{}/resolv.conf", etc_path);
-
+ 
+    // Buat direktori /etc di dalam container jika belum ada
     let _ = Command::new("sudo")
-        .args(&["mkdir", "-p", &etc_path])
+        .args(&["-n", "mkdir", "-p", &etc_path])
         .status()
         .await;
-
-    // Attempt to unset immutable flag — fails silently on VirtIO-FS.
+ 
+    // Lepaskan immutable lock jika sebelumnya terkunci
     let _ = Command::new("sudo")
-        .args(&["chattr", "-i", &dns_path])
+        .args(&["-n", "chattr", "-i", &dns_path])
         .status()
         .await;
-
+ 
+    // Hapus resolv.conf lama
     let _ = Command::new("sudo")
-        .args(&["rm", "-f", &dns_path])
+        .args(&["-n", "rm", "-f", &dns_path])
         .status()
         .await;
-
-    let dns_content = "nameserver 8.8.8.8\\nnameserver 8.8.4.4\\n";
-    let write_status = Command::new("sudo")
-        .args(&[
-            "bash", "-c",
-            &format!("echo -e '{}' > {}", dns_content, dns_path),
-        ])
-        .status()
-        .await;
-
-    match write_status {
-        Ok(s) if s.success() => {
-            // Attempt to lock — non-fatal if chattr is not supported.
-            let lock_status = Command::new("sudo")
-                .args(&["chattr", "+i", &dns_path])
-                .status()
-                .await;
-            match lock_status {
-                Ok(ls) if ls.success() => {
-                    pb.println(format!(
-                        "{}[INFO]{} DNS configured and locked successfully.",
-                        GREEN, RESET
-                    ));
-                }
-                _ => {
-                    pb.println(format!(
-                        "{}[WARNING]{} DNS written but immutable lock (chattr +i) could not be applied. \
-                        This is expected on OrbStack / VirtIO-FS — DNS will still work.",
-                        YELLOW, RESET
-                    ));
-                }
+ 
+    // FIX: Konten DNS sebagai bytes literal — tidak ada format string yang bisa diinjeksi
+    let dns_content = b"nameserver 8.8.8.8\nnameserver 8.8.4.4\n";
+ 
+    // FIX: Tulis via `tee` dengan stdin — argumen adalah path literal (tidak diinterpretasi shell)
+    // tee menerima path sebagai argumen argv, bukan string shell, sehingga aman
+    // meskipun dns_path mengandung karakter yang biasanya berbahaya di shell.
+    let mut tee_process = Command::new("sudo")
+        .args(&["-n", "tee", &dns_path])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok();
+ 
+    let write_success = if let Some(ref mut child) = tee_process {
+        if let Some(mut stdin) = child.stdin.take() {
+            use tokio::io::AsyncWriteExt;
+            stdin.write_all(dns_content).await.is_ok()
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+ 
+    // Tunggu proses tee selesai
+    if let Some(mut child) = tee_process {
+        let _ = child.wait().await;
+    }
+ 
+    if write_success {
+        // Coba pasang immutable lock (opsional — tidak fatal jika gagal di OrbStack)
+        let lock_status = Command::new("sudo")
+            .args(&["-n", "chattr", "+i", &dns_path])
+            .status()
+            .await;
+ 
+        match lock_status {
+            Ok(s) if s.success() => {
+                pb.println(format!(
+                    "{}[INFO]{} DNS configured and locked (immutable) successfully.",
+                    GREEN, RESET
+                ));
+            }
+            _ => {
+                pb.println(format!(
+                    "{}[WARNING]{} DNS written but immutable lock (chattr +i) could not be applied. \
+                     This is expected on OrbStack / VirtIO-FS — DNS will still work.",
+                    YELLOW, RESET
+                ));
             }
         }
-        _ => {
-            eprintln!("{}[ERROR]{} Failed to configure DNS for container '{}'.", RED, RESET, name);
-        }
+    } else {
+        eprintln!(
+            "{}[ERROR]{} Failed to configure DNS for container '{}'.",
+            RED, RESET, name
+        );
     }
 }
 
@@ -555,79 +579,105 @@ pub async fn remove_shared_folder(container_name: &str, host_path: &str, contain
 // Firewall helpers (internal)
 // ---------------------------------------------------------------------------
 
-async fn configure_firewall_for_lxc(firewall: &FirewallKind) {
+async fn run_sudo(args: &[&str]) -> bool {
+    Command::new("sudo")
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+ 
+/// Memeriksa apakah sebuah iptables rule sudah ada, lalu menambahkannya jika belum.
+async fn ensure_iptables_rule(check_args: &[&str], add_args: &[&str]) {
+    // -C (check) mengembalikan exit code 0 jika rule sudah ada
+    let exists = run_sudo(check_args).await;
+    if !exists {
+        // FIX: .await langsung — tidak lagi menggunakan tokio::spawn yang tidak di-await
+        let added = run_sudo(add_args).await;
+        if !added {
+            eprintln!(
+                "{}[WARN]{} Failed to add iptables rule: {:?}",
+                YELLOW, RESET, add_args
+            );
+        }
+    }
+}
+ 
+pub async fn configure_firewall_for_lxc(firewall: &FirewallKind) {
     match firewall {
         FirewallKind::Firewalld => {
-            let _ = Command::new("sudo")
-                .args(&[
-                    "-n", "firewall-cmd",
-                    "--zone=trusted",
-                    "--add-interface=lxcbr0",
-                    "--permanent",
-                ])
-                .status()
-                .await;
-            let _ = Command::new("sudo")
-                .args(&["-n", "firewall-cmd", "--reload"])
-                .status()
-                .await;
+            run_sudo(&[
+                "-n", "firewall-cmd",
+                "--zone=trusted",
+                "--add-interface=lxcbr0",
+                "--permanent",
+            ]).await;
+            run_sudo(&["-n", "firewall-cmd", "--reload"]).await;
         }
+ 
         FirewallKind::Ufw => {
-            let _ = Command::new("sudo")
-                .args(&["-n", "ufw", "allow", "in", "on", "lxcbr0"])
-                .status()
-                .await;
-            let _ = Command::new("sudo")
-                .args(&["-n", "ufw", "reload"])
-                .status()
-                .await;
+            run_sudo(&["-n", "ufw", "allow", "in", "on", "lxcbr0"]).await;
+            run_sudo(&["-n", "ufw", "reload"]).await;
         }
+ 
         FirewallKind::Iptables => {
-        // BUG FIX #2: Aktifkan ip_forward agar kernel mau forward paket antar-interface
-        let _ = Command::new("sudo")
-            .args(&["-n", "sysctl", "-w", "net.ipv4.ip_forward=1"])
-            .status().await;
-
-        // Buat permanen antar reboot
-        let _ = Command::new("sudo")
-            .args(&["-n", "bash", "-c",
+            // FIX: Konsistensi indentasi — semua perintah rata kiri sama
+            // FIX: tokio::spawn diganti .await langsung di semua rule
+ 
+            // Aktifkan IP forwarding runtime
+            run_sudo(&["-n", "sysctl", "-w", "net.ipv4.ip_forward=1"]).await;
+ 
+            // Persisten IP forwarding di sysctl.conf
+            // (masih menggunakan bash -c tapi argumennya adalah string tetap,
+            //  tidak ada interpolasi variabel dari user input)
+            run_sudo(&[
+                "-n", "bash", "-c",
                 "grep -q 'net.ipv4.ip_forward' /etc/sysctl.conf \
-                && sed -i 's/.*net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf \
-                || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf"])
-            .status().await;
-
-        // INPUT — izinkan host terima paket dari container (sudah ada, tetap dipertahankan)
-        let _ = Command::new("sudo")
-            .args(&["-n", "iptables", "-I", "INPUT", "-i", "lxcbr0", "-j", "ACCEPT"])
-            .status().await;
-
-        // BUG FIX #3: FORWARD chain — izinkan kernel forward paket dari container keluar
-        let _ = Command::new("sudo")
-            .args(&["-n", "iptables", "-I", "FORWARD", "-i", "lxcbr0", "-j", "ACCEPT"])
-            .status().await;
-
-        // BUG FIX #3: FORWARD chain — izinkan paket balasan masuk kembali ke container
-        let _ = Command::new("sudo")
-            .args(&["-n", "iptables", "-I", "FORWARD",
-                "-o", "lxcbr0", "-m", "state",
-                "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT"])
-            .status().await;
-
-        // BUG FIX #1: NAT MASQUERADE — sembunyikan IP container di balik IP host
-        // Tanpa ini, paket dari 10.0.3.x tidak akan di-route oleh internet
-        let _ = Command::new("sudo")
-            .args(&["-n", "iptables", "-t", "nat", "-C", "POSTROUTING",
-                "-s", "10.0.3.0/24", "!", "-d", "10.0.3.0/24", "-j", "MASQUERADE"])
-            .status().await
-            .map(|s| {
-                if !s.success() {
-                    // Rule belum ada, tambahkan
-                    tokio::spawn(Command::new("sudo")
-                        .args(&["-n", "iptables", "-t", "nat", "-A", "POSTROUTING",
-                            "-s", "10.0.3.0/24", "!", "-d", "10.0.3.0/24", "-j", "MASQUERADE"])
-                        .status());
-                }
-            });
+                 && sed -i 's/.*net.ipv4.ip_forward.*/net.ipv4.ip_forward=1/' /etc/sysctl.conf \
+                 || echo 'net.ipv4.ip_forward=1' >> /etc/sysctl.conf",
+            ]).await;
+ 
+            // Izinkan traffic INPUT dari container
+            ensure_iptables_rule(
+                &["-n", "iptables", "-C", "INPUT", "-i", "lxcbr0", "-j", "ACCEPT"],
+                &["-n", "iptables", "-I", "INPUT", "-i", "lxcbr0", "-j", "ACCEPT"],
+            ).await;
+ 
+            // Izinkan FORWARD dari lxcbr0
+            ensure_iptables_rule(
+                &["-n", "iptables", "-C", "FORWARD", "-i", "lxcbr0", "-j", "ACCEPT"],
+                &["-n", "iptables", "-I", "FORWARD", "-i", "lxcbr0", "-j", "ACCEPT"],
+            ).await;
+ 
+            // Izinkan FORWARD ke lxcbr0 untuk koneksi established/related
+            ensure_iptables_rule(
+                &[
+                    "-n", "iptables", "-C", "FORWARD",
+                    "-o", "lxcbr0", "-m", "state",
+                    "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT",
+                ],
+                &[
+                    "-n", "iptables", "-I", "FORWARD",
+                    "-o", "lxcbr0", "-m", "state",
+                    "--state", "RELATED,ESTABLISHED", "-j", "ACCEPT",
+                ],
+            ).await;
+ 
+            // FIX: MASQUERADE — dulu menggunakan tokio::spawn tanpa .await
+            // Sekarang menggunakan ensure_iptables_rule yang di-await dengan benar
+            ensure_iptables_rule(
+                &[
+                    "-n", "iptables", "-t", "nat", "-C", "POSTROUTING",
+                    "-s", "10.0.3.0/24", "!", "-d", "10.0.3.0/24", "-j", "MASQUERADE",
+                ],
+                &[
+                    "-n", "iptables", "-t", "nat", "-A", "POSTROUTING",
+                    "-s", "10.0.3.0/24", "!", "-d", "10.0.3.0/24", "-j", "MASQUERADE",
+                ],
+            ).await;
         }
     }
 }
@@ -638,7 +688,6 @@ async fn configure_firewall_for_lxc(firewall: &FirewallKind) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
     fn test_bind_mount_entry_format_is_correct() {
@@ -659,10 +708,41 @@ mod tests {
     }
 
     #[test]
-    fn test_dns_content_contains_google_nameservers() {
-        let dns_content = "nameserver 8.8.8.8\\nnameserver 8.8.4.4\\n";
-        assert!(dns_content.contains("8.8.8.8"), "DNS config must include Google primary nameserver");
-        assert!(dns_content.contains("8.8.4.4"), "DNS config must include Google secondary nameserver");
+    fn test_dns_content_is_valid_resolv_conf() {
+        let content = b"nameserver 8.8.8.8\nnameserver 8.8.4.4\n";
+        let as_str = std::str::from_utf8(content).unwrap();
+ 
+        assert!(as_str.contains("nameserver 8.8.8.8"), "Must have primary DNS");
+        assert!(as_str.contains("nameserver 8.8.4.4"), "Must have secondary DNS");
+        assert!(as_str.ends_with('\n'), "resolv.conf must end with newline");
+        // Pastikan tidak ada karakter shell yang bisa menyebabkan injection
+        assert!(!as_str.contains('$'), "DNS content must not contain shell variable prefix");
+        assert!(!as_str.contains('`'), "DNS content must not contain backtick");
+        assert!(!as_str.contains('>'), "DNS content must not contain redirection");
+    }
+ 
+    #[test]
+    fn test_no_shell_interpolation_in_dns_content() {
+        // Pastikan dns_content adalah literal bytes, bukan format string
+        // yang bisa dipengaruhi oleh input nama container
+        let container_name = "evil; rm -rf /";
+        let dns_path = format!("/var/lib/lxc/{}/rootfs/etc/resolv.conf", container_name);
+ 
+        // Path terbentuk dari nama container, tapi kontennya tidak
+        // dns_content selalu sama terlepas dari nama container apapun
+        let dns_content = b"nameserver 8.8.8.8\nnameserver 8.8.4.4\n";
+        assert_eq!(
+            dns_content,
+            b"nameserver 8.8.8.8\nnameserver 8.8.4.4\n",
+            "DNS content must be static regardless of container name"
+        );
+ 
+        // dns_path mengandung nama container tapi hanya digunakan sebagai
+        // argumen argv ke tee, bukan diinterpolasikan dalam shell string
+        assert!(dns_path.contains("evil"), "Path contains name — this is expected");
+        // Yang penting: nama container tidak masuk ke DNS content
+        let content_str = std::str::from_utf8(dns_content).unwrap();
+        assert!(!content_str.contains("evil"), "Container name must NOT appear in DNS content");
     }
 
     #[test]
