@@ -97,23 +97,6 @@ pub fn sudoers_file_path(username: &str) -> String {
 }
  
 // ── FIX #1: configure_sudoers — Perbaiki TOCTOU race condition ───────────────
-//
-// SEBELUMNYA (BERMASALAH):
-//   1. Tulis ke {sudoers_path}.tmp
-//   2. visudo check ← OK
-//   [JEDA — window serangan di sini]
-//   3. chmod 0440
-//   4. mv .tmp → final
-//   → Antara langkah 2 dan 4, proses lain bisa replace isi .tmp file.
-//
-// SESUDAHNYA (AMAN):
-//   1. Buat temp file di /tmp (bukan di /etc/sudoers.d) dengan nama acak.
-//   2. Set permission 0400 sebelum visudo check.
-//   3. visudo check pada temp file.
-//   4. mv atomik ke path final di /etc/sudoers.d.
-//   → Window serangan dieliminasi karena file di /tmp tidak punya privilege.
-//   → mv di filesystem yang sama = operasi atomik.
-//
 pub async fn configure_sudoers(username: &str, role: UserRole, audit: bool) {
     let sudoers_rule = build_sudoers_rule(username, &role);
     if sudoers_rule.is_empty() {
