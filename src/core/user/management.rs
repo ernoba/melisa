@@ -11,18 +11,16 @@
 use std::process::Stdio;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
-
 use crate::cli::color::{BOLD, GREEN, RED, RESET, YELLOW};
 use crate::core::root_check::ensure_admin;
-// FIX: hapus `check_if_admin` dari root_check (tidak dipakai di sini, ada warning).
-// FIX: ganti `clean_orphaned_sudoers_files_from_passwd` → `remove_orphaned_sudoers_files`
-//      (nama fungsi yang sebenarnya ada di sudoers.rs)
 use crate::core::user::sudoers::{
-    configure_sudoers, remove_orphaned_sudoers_files,
-    check_if_admin as sudoers_check_if_admin,
+    configure_sudoers,
+    remove_orphaned_sudoers_files,
+    check_if_admin,                 // ← tidak pakai alias
+    SUDOERS_DIR,                    // ← tambahan
+    SUDOERS_FILE_PREFIX,            // ← tambahan
 };
 use crate::core::user::types::UserRole;
-
 // ── Passwd shell path ────────────────────────────────────────────────────────
 
 /// Shell assigned to every MELISA-managed user, acting as the jail shell.
@@ -44,80 +42,89 @@ const MELISA_SHELL_PATH: &str = "/usr/local/bin/melisa";
 /// * `username` - The new system username.
 /// * `audit`    - When `true`, subprocess commands are logged to the terminal.
 pub async fn add_melisa_user(username: &str, audit: bool) {
-    if !ensure_admin().await {
+    use crate::core::project::management::validate_server_username;
+ 
+    if !crate::core::root_check::ensure_admin().await {
         return;
     }
-
+ 
+    // ── FIX: Validasi username sebelum operasi apapun ────────────────────
+    if let Err(e) = validate_server_username(username) {
+        eprintln!("{}[ERROR]{} {}", RED, RESET, e);
+        return;
+    }
+ 
     println!("\n{}--- Provisioning New MELISA User: {} ---{}", BOLD, username, RESET);
     println!("{}Select Access Level for {}:{}", BOLD, username, RESET);
     println!("  1) Administrator (Full Management: Users, Projects & LXC)");
     println!("  2) Standard User (Project & LXC Management Only)");
     print!("Enter choice (1/2): ");
-
-    let _ = io::stdout().flush().await;
+ 
+    // ── FIX: Gunakan async stdin, bukan blocking std::io::stdin ──────────
+    //
+    // SEBELUMNYA (BERMASALAH):
+    //   let stdin = std::io::stdin();
+    //   let _ = stdin.read_line(&mut raw_choice);
+    //   → Blocking call di dalam async context memblokir thread Tokio.
+    //
+    // SESUDAHNYA (AMAN):
+    //   tokio::io::stdin() dengan BufReader async.
+    //
+    let _ = tokio::io::stdout().flush().await;
     let mut raw_choice = String::new();
-    let stdin = std::io::stdin();
-    let _ = stdin.read_line(&mut raw_choice);
-
+    let stdin = tokio::io::stdin();
+    let mut reader = BufReader::new(stdin);
+    let _ = reader.read_line(&mut raw_choice).await;
+ 
     let role = match raw_choice.trim() {
-        "1" => UserRole::Admin,
-        _ => UserRole::Regular,
+        "1" => crate::core::user::types::UserRole::Admin,
+        _   => crate::core::user::types::UserRole::Regular,
     };
-
+ 
     if audit {
         println!(
-            "[AUDIT] Running: useradd -m -s {} {}",
-            MELISA_SHELL_PATH, username
+            "[AUDIT] Running: useradd -m -s /usr/local/bin/melisa {}",
+            username
         );
     }
-
     let status = Command::new("sudo")
-        .args(&["useradd", "-m", "-s", MELISA_SHELL_PATH, username])
+        .args(&["useradd", "-m", "-s", "/usr/local/bin/melisa", username])
         .stdout(if audit { Stdio::inherit() } else { Stdio::null() })
         .stderr(if audit { Stdio::inherit() } else { Stdio::null() })
         .status()
         .await;
-
+ 
     match status {
         Ok(s) if s.success() => {
             println!(
                 "{}[SUCCESS]{} User account '{}' successfully created.",
                 GREEN, RESET, username
             );
-
-            // Restrict home directory access to owner only.
             let home_dir = format!("/home/{}", username);
             let _ = Command::new("sudo")
                 .args(&["chmod", "700", &home_dir])
                 .status()
                 .await;
-
-            // Set initial password; if it fails, do not deploy sudoers.
-            if set_user_password(username).await {
-                configure_sudoers(username, role.clone(), audit).await;
-
-                // Tambahkan logika ini di dalam fungsi add_melisa_user dan upgrade_user
-                // tepat setelah pemanggilan configure_sudoers()
-
-                if role == UserRole::Admin {
-                    // Deteksi grup yang tersedia (sudo atau wheel)
-                    let group = if Command::new("getent").arg("group").arg("sudo").output().await.map_or(false, |o| o.status.success()) {
+            if crate::core::user::management::set_user_password(username).await {
+                crate::core::user::sudoers::configure_sudoers(username, role.clone(), audit).await;
+                if role == crate::core::user::types::UserRole::Admin {
+                    let group = if Command::new("getent")
+                        .arg("group").arg("sudo").output().await
+                        .map_or(false, |o| o.status.success())
+                    {
                         "sudo"
                     } else {
                         "wheel"
                     };
-
                     if audit {
                         println!("[AUDIT] Adding user '{}' to system group '{}'", username, group);
                     }
-
                     let _ = Command::new("sudo")
                         .args(&["usermod", "-aG", group, username])
                         .status()
                         .await;
                 }
             }
-            
         }
         _ => {
             eprintln!(
@@ -248,74 +255,50 @@ pub async fn delete_melisa_user(username: &str, audit: bool) {
 /// Also scans `/etc/sudoers.d/` and reports any orphaned policy files.
 /// Requires administrator privileges.
 pub async fn list_melisa_users() {
-    if !ensure_admin().await {
+    if !crate::core::root_check::ensure_admin().await {
         return;
     }
     println!("\n{}--- Registered MELISA Accounts ---{}", BOLD, RESET);
-
+ 
     let mut existing_usernames: Vec<String> = Vec::new();
-
-    // 1. Tambahkan user saat ini (via sudo)
-    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
-        existing_usernames.push(sudo_user);
-    }
-
-    // 2. Tambahkan SEMUA user yang punya file di /etc/sudoers.d/melisa_*
-    // Ini menjamin user host seperti 'saferoom' tidak dianggap orphan
-    let files = Command::new("ls").arg("/etc/sudoers.d/").output().await;
-    if let Ok(out) = files {
-        let list = String::from_utf8_lossy(&out.stdout);
-        for line in list.lines() {
-            if line.starts_with("melisa_") {
-                let u = line.trim_start_matches("melisa_");
-                // Cek apakah user benar-benar ada di sistem OS
-                if Command::new("id").arg(u).status().await.map_or(false, |s| s.success()) {
-                    if !existing_usernames.contains(&u.to_string()) {
-                        existing_usernames.push(u.to_string());
-                    }
+ 
+    // Baca sudoers directory dengan fs::read_dir (bukan ls)
+    let read_result = tokio::fs::read_dir(SUDOERS_DIR).await;
+    if let Ok(mut entries) = read_result {
+        while let Ok(Some(entry)) = entries.next_entry().await {
+            let file_name = match entry.file_name().into_string() {
+                Ok(name) => name,
+                Err(_) => continue,
+            };
+            if !file_name.starts_with(SUDOERS_FILE_PREFIX) {
+                continue;
+            }
+            let u = file_name.trim_start_matches(SUDOERS_FILE_PREFIX).to_string();
+            // Validasi username yang di-derive
+            if crate::core::project::management::validate_server_username(&u).is_err() {
+                continue;
+            }
+            // Verifikasi user benar-benar ada di sistem
+            if Command::new("id").arg(&u).status().await.map_or(false, |s| s.success()) {
+                // FIX: cek duplikasi sebelum push (tidak push dua kali)
+                if !existing_usernames.contains(&u) {
+                    existing_usernames.push(u);
                 }
             }
         }
     }
-
-    // 1. Daftarkan Host User (Admin Utama OS) terlebih dahulu agar tidak dianggap orphan
-    if let Ok(sudo_user) = std::env::var("SUDO_USER") {
-        if !sudo_user.is_empty() {
-            existing_usernames.push(sudo_user.clone());
-            let role_tag = format!("{}[HOST ADMINISTRATOR]{}", GREEN, RESET);
-            println!("  > {:<20} {}", sudo_user, role_tag);
-        }
+ 
+    if existing_usernames.is_empty() {
+        println!("  {}No MELISA users found.{}", YELLOW, RESET);
+        return;
     }
-
-    // 2. Dapatkan user lain yang dibuat khusus melalui shell MELISA
-    let passwd_output = Command::new("sudo")
-        .args(&["grep", MELISA_SHELL_PATH, "/etc/passwd"])
-        .output()
-        .await;
-
-    if let Ok(out) = passwd_output {
-        let passwd_text = String::from_utf8_lossy(&out.stdout);
-        for line in passwd_text.lines() {
-            if let Some(username) = line.split(':').next() {
-                // Hindari duplikasi jika username sama dengan sudo_user
-                if !existing_usernames.contains(&username.to_string()) {
-                    existing_usernames.push(username.to_string());
-                    let role_tag = if sudoers_check_if_admin(username).await {
-                        format!("{}[ADMINISTRATOR]{}", GREEN, RESET)
-                    } else {
-                        format!("{}[STANDARD USER]{}", YELLOW, RESET)
-                    };
-                    println!("  > {:<20} {}", username, role_tag);
-                }
-            }
-        }
+ 
+    for username in &existing_usernames {
+        let is_admin = check_if_admin(username).await;
+        let role_tag = if is_admin { "[Admin]" } else { "[User]" };
+        println!("  {GREEN}•{RESET} {username} {YELLOW}{role_tag}{RESET}");
     }
-
-    println!(
-        "\n{}--- Scanning for Orphaned Sudoers Configurations ---{}",
-        BOLD, RESET
-    );
-    report_orphaned_sudoers(&existing_usernames).await;
+    println!();
 }
 
 /// Prints orphaned sudoers file names to the terminal without removing them.

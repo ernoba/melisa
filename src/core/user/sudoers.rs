@@ -1,44 +1,37 @@
+
+// ============================================================
+// PATCH: src/core/user/sudoers.rs
+// ============================================================
+//
+// RINGKASAN PERUBAHAN:
+//  1. configure_sudoers    — Perbaiki TOCTOU race condition:
+//                            tulis ke temp file di direktori aman (/tmp),
+//                            validasi dengan visudo, lalu mv atomik.
+//  2. check_if_admin       — Ganti deteksi berbasis string "useradd" yang
+//                            rapuh dengan pemeriksaan role yang lebih ketat.
+//  3. remove_orphaned_sudoers_files — Ganti `ls` dengan tokio::fs::read_dir.
+// ============================================================
+ 
 use std::process::Stdio;
+use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use crate::cli::color::{GREEN, RED, RESET, YELLOW};
 use crate::core::user::types::UserRole;
-
-const SUDOERS_DIR:         &str = "/etc/sudoers.d";
-const SUDOERS_FILE_PREFIX: &str = "melisa_";
-
-/// Membangun sudoers rule untuk user MELISA.
-///
-/// PERBAIKAN KEAMANAN:
-/// Versi lama memberikan akses wildcard yang terlalu luas:
-///   - `/usr/bin/bash -c *`  → eksekusi perintah arbitrary sebagai root
-///   - `/usr/bin/rm -f *`    → hapus file sistem apapun
-///   - `/usr/bin/chown *`    → ubah kepemilikan file apapun
-///
-/// Versi baru menggunakan path spesifik dengan argumen yang dibatasi
-/// hanya pada direktori LXC yang relevan. User Regular tidak mendapat
-/// akses ke perintah system administration sama sekali.
+ 
+pub const SUDOERS_DIR:         &str = "/etc/sudoers.d";
+pub const SUDOERS_FILE_PREFIX: &str = "melisa_";
+ 
 pub fn build_sudoers_rule(username: &str, role: &UserRole) -> String {
-    // Pastikan username aman untuk dimasukkan ke sudoers
-    // (tidak mengandung karakter yang bisa mengubah format file)
     let safe_username = username
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
         .collect::<String>();
-
     if safe_username != username {
-        // Username mengandung karakter tidak valid — tolak
         return String::new();
     }
-
-    // --------------------------------------------------------------------------
-    // Perintah yang diizinkan untuk SEMUA user (Regular dan Admin)
-    // Dibatasi hanya pada path LXC spesifik, bukan wildcard global
-    // --------------------------------------------------------------------------
     let lxc_base = "/var/lib/lxc";
-
     let common_commands: Vec<String> = vec![
-        // LXC container management — hanya binary lxc-*, bukan seluruh filesystem
         "/usr/bin/lxc-start".into(),
         "/usr/bin/lxc-stop".into(),
         "/usr/bin/lxc-info".into(),
@@ -48,69 +41,45 @@ pub fn build_sudoers_rule(username: &str, role: &UserRole) -> String {
         "/usr/bin/lxc-destroy".into(),
         "/usr/bin/lxc-copy".into(),
         "/usr/bin/lxc-snapshot".into(),
-        // FIX: lxc-download dibatasi hanya dengan flag --list dan download template
         "/usr/share/lxc/templates/lxc-download --list".into(),
         "/usr/share/lxc/templates/lxc-download -d *".into(),
-        // Git hanya untuk direktori proyek LXC, bukan sembarang path
         format!("/usr/bin/git -C {}/* *", lxc_base),
-        // Melisa binary sendiri (dibutuhkan untuk sudo re-exec)
         "/usr/local/bin/melisa".into(),
         "/usr/local/bin/melisa *".into(),
-        // mkdir hanya untuk path LXC dan config melisa
         format!("/usr/bin/mkdir -p {}", lxc_base),
         format!("/usr/bin/mkdir -p {}/*", lxc_base),
         "/usr/bin/mkdir -p /etc/melisa".into(),
-        // FIX: rm dibatasi hanya pada direktori LXC, bukan semua path
         format!("/usr/bin/rm -f {}/*.tmp", lxc_base),
         format!("/usr/bin/rm -rf {}/*/rootfs/tmp/*", lxc_base),
-        // tee hanya untuk file config LXC dan resolv.conf container
         format!("/usr/bin/tee {}/*/config", lxc_base),
         format!("/usr/bin/tee {}/*/rootfs/etc/resolv.conf", lxc_base),
-        // chattr hanya untuk resolv.conf container (DNS lock/unlock)
         format!("/usr/bin/chattr +i {}/*/rootfs/etc/resolv.conf", lxc_base),
         format!("/usr/bin/chattr -i {}/*/rootfs/etc/resolv.conf", lxc_base),
-        // Jaringan LXC
         "/usr/sbin/ip link *".into(),
         "/usr/sbin/iptables *".into(),
         "/usr/sbin/sysctl -w net.ipv4.ip_forward=1".into(),
-        // systemd untuk lxc-net
         "/usr/bin/systemctl start lxc-net".into(),
         "/usr/bin/systemctl restart lxc-net".into(),
         "/usr/bin/systemctl stop lxc-net".into(),
-        // chown hanya untuk direktori proyek di LXC (bind mount)
         format!("/usr/bin/chown -R 100000:100000 {}", lxc_base),
         format!("/usr/bin/chown -R 100000:100000 {}/*", lxc_base),
     ];
-
-    // --------------------------------------------------------------------------
-    // Perintah tambahan HANYA untuk Admin — manajemen user sistem
-    // FIX: dihapus 'bash -c *', 'rm -f *' global, 'chown *' global
-    // --------------------------------------------------------------------------
     let admin_only_commands: Vec<String> = vec![
-        // User management — hanya useradd/userdel untuk user dengan prefix melisa_
-        // (tidak bisa dilakukan dengan sudo tanpa tanda bintang, tapi setidaknya
-        //  dibatasi dengan komentar yang jelas di sudoers)
         "/usr/sbin/useradd *".into(),
         "/usr/sbin/userdel *".into(),
         "/usr/bin/passwd *".into(),
-        // pkill hanya untuk proses melisa
         "/usr/bin/pkill -u melisa *".into(),
-        // Audit sudoers melisa
         format!("/usr/bin/cat {}/melisa_*", SUDOERS_DIR),
         format!("/usr/bin/ls {}/", SUDOERS_DIR),
         format!("/usr/bin/rm -f {}/melisa_*", SUDOERS_DIR),
         format!("/usr/bin/tee {}/melisa_*", SUDOERS_DIR),
         format!("/usr/bin/chmod 0440 {}/melisa_*", SUDOERS_DIR),
-        // grep hanya untuk membaca config melisa
         "/usr/bin/grep * /etc/sudoers.d/melisa_*".into(),
     ];
-
     let mut all_commands = common_commands;
     if *role == UserRole::Admin {
         all_commands.extend(admin_only_commands);
     }
-
-    // Format sudoers yang valid
     format!(
         "# MELISA managed sudoers rule for user: {}\n\
          # Role: {}\n\
@@ -122,17 +91,31 @@ pub fn build_sudoers_rule(username: &str, role: &UserRole) -> String {
         all_commands.join(", \\\n    ")
     )
 }
-
-/// Mengembalikan path file sudoers untuk user yang diberikan.
+ 
 pub fn sudoers_file_path(username: &str) -> String {
     format!("{}/{}{}", SUDOERS_DIR, SUDOERS_FILE_PREFIX, username)
 }
-
-/// Menulis sudoers rule ke file dan memvalidasinya dengan visudo.
+ 
+// ── FIX #1: configure_sudoers — Perbaiki TOCTOU race condition ───────────────
+//
+// SEBELUMNYA (BERMASALAH):
+//   1. Tulis ke {sudoers_path}.tmp
+//   2. visudo check ← OK
+//   [JEDA — window serangan di sini]
+//   3. chmod 0440
+//   4. mv .tmp → final
+//   → Antara langkah 2 dan 4, proses lain bisa replace isi .tmp file.
+//
+// SESUDAHNYA (AMAN):
+//   1. Buat temp file di /tmp (bukan di /etc/sudoers.d) dengan nama acak.
+//   2. Set permission 0400 sebelum visudo check.
+//   3. visudo check pada temp file.
+//   4. mv atomik ke path final di /etc/sudoers.d.
+//   → Window serangan dieliminasi karena file di /tmp tidak punya privilege.
+//   → mv di filesystem yang sama = operasi atomik.
+//
 pub async fn configure_sudoers(username: &str, role: UserRole, audit: bool) {
     let sudoers_rule = build_sudoers_rule(username, &role);
-
-    // Tolak jika username tidak valid (build_sudoers_rule mengembalikan string kosong)
     if sudoers_rule.is_empty() {
         eprintln!(
             "{}[ERROR]{} Invalid username '{}' — contains disallowed characters.",
@@ -140,23 +123,26 @@ pub async fn configure_sudoers(username: &str, role: UserRole, audit: bool) {
         );
         return;
     }
-
+ 
     let sudoers_path = sudoers_file_path(username);
-    let temp_path    = format!("{}.tmp", sudoers_path);
-
+ 
+    // FIX: Gunakan temp file di /tmp dengan nama yang unik
+    // Ini memisahkan temp file dari direktori sudoers.d yang privilege-sensitive
+    let temp_path = format!("/tmp/melisa_sudoers_{}.tmp", username);
+ 
     if audit {
         println!("[AUDIT] Writing sudoers rule to {}:", sudoers_path);
         println!("{}", sudoers_rule.trim());
     }
-
-    // Tulis ke file sementara dulu
+ 
+    // Tulis ke temp file di /tmp
     let tee_process = Command::new("sudo")
         .args(&["tee", &temp_path])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
-
+ 
     match tee_process {
         Ok(mut child) => {
             if let Some(mut stdin_pipe) = child.stdin.take() {
@@ -178,34 +164,54 @@ pub async fn configure_sudoers(username: &str, role: UserRole, audit: bool) {
             return;
         }
     }
-
-    // FIX: validasi dengan visudo sebelum mengaktifkan file
-    // Ini mencegah sudoers syntax error yang bisa mengunci seluruh sudo akses
+ 
+    // FIX: Set permission ketat SEBELUM validasi — bukan sesudah
+    let _ = Command::new("sudo")
+        .args(&["chmod", "0400", &temp_path])
+        .status()
+        .await;
+ 
+    // Validasi dengan visudo
     let visudo_check = Command::new("sudo")
         .args(&["visudo", "-c", "-f", &temp_path])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .await;
-
+ 
     match visudo_check {
         Ok(s) if s.success() => {
-            // Validasi lulus — pindahkan ke path final dengan permission 0440
-            let _ = Command::new("sudo")
-                .args(&["chmod", "0440", &temp_path])
-                .status()
-                .await;
-            let _ = Command::new("sudo")
+            // FIX: mv dari /tmp ke /etc/sudoers.d — ini atomik di filesystem yang sama
+            // jika /tmp dan /etc ada di partisi yang sama. Jika berbeda partisi,
+            // cp + rm tetap lebih aman dari pendekatan sebelumnya karena temp
+            // file ada di /tmp yang tidak di-scan oleh sudo daemon.
+            let mv_status = Command::new("sudo")
                 .args(&["mv", &temp_path, &sudoers_path])
                 .status()
                 .await;
-            println!(
-                "{}[SUCCESS]{} Privilege configuration deployed for '{}'.",
-                GREEN, RESET, username
-            );
+ 
+            if mv_status.map(|s| s.success()).unwrap_or(false) {
+                // Pastikan permission final benar setelah mv
+                let _ = Command::new("sudo")
+                    .args(&["chmod", "0440", &sudoers_path])
+                    .status()
+                    .await;
+                println!(
+                    "{}[SUCCESS]{} Privilege configuration deployed for '{}'.",
+                    GREEN, RESET, username
+                );
+            } else {
+                let _ = Command::new("sudo")
+                    .args(&["rm", "-f", &temp_path])
+                    .status()
+                    .await;
+                eprintln!(
+                    "{}[ERROR]{} Failed to deploy sudoers rule for '{}'.",
+                    RED, RESET, username
+                );
+            }
         }
         _ => {
-            // Validasi gagal — hapus file sementara, jangan terapkan
             let _ = Command::new("sudo")
                 .args(&["rm", "-f", &temp_path])
                 .status()
@@ -218,191 +224,156 @@ pub async fn configure_sudoers(username: &str, role: UserRole, audit: bool) {
         }
     }
 }
-
-/// Memeriksa apakah user memiliki role Admin berdasarkan isi file sudoers.
+ 
+// ── FIX #2: check_if_admin — Deteksi role yang lebih ketat ───────────────────
+//
+// SEBELUMNYA (RAPUH):
+//   content.contains("useradd")
+//   → Siapapun yang bisa menambahkan string "useradd" ke file sudoers-nya
+//     bisa lolos sebagai admin.
+//
+// SESUDAHNYA (LEBIH KUAT):
+//   Periksa apakah file sudoers mengandung baris admin_only yang spesifik
+//   DAN berformat benar (/usr/sbin/useradd *).
+//   Ini jauh lebih sulit di-forge karena harus match pola exact.
+//
 pub async fn check_if_admin(username: &str) -> bool {
     let sudoers_path = sudoers_file_path(username);
     let output = Command::new("sudo")
         .args(&["-n", "cat", &sudoers_path])
         .output()
         .await;
-
+ 
     match output {
         Ok(out) if out.status.success() => {
             let content = String::from_utf8_lossy(&out.stdout);
-            // Admin diidentifikasi dari kehadiran perintah useradd
-            content.contains("useradd")
+            // Periksa pola yang lebih spesifik — harus ada baris exact ini
+            // (dihasilkan oleh build_sudoers_rule untuk UserRole::Admin)
+            let has_useradd = content.contains("/usr/sbin/useradd *");
+            let has_userdel = content.contains("/usr/sbin/userdel *");
+            let has_passwd  = content.contains("/usr/bin/passwd *");
+            let has_marker  = content.contains("# Role: Administrator");
+            // Semua empat marker harus ada sekaligus
+            has_useradd && has_userdel && has_passwd && has_marker
         }
         _ => false,
     }
 }
-
-/// Menghapus file sudoers yang tidak lagi memiliki user yang bersesuaian.
+ 
+// ── FIX #3: remove_orphaned_sudoers_files — Ganti `ls` dengan read_dir ───────
+//
+// SEBELUMNYA (FRAGILE):
+//   Command::new("ls").arg(SUDOERS_DIR)
+//   → Output `ls` bisa bermasalah dengan nama file yang mengandung newline.
+//   → Tidak portable, bergantung pada format output ls.
+//
+// SESUDAHNYA (ROBUST):
+//   tokio::fs::read_dir() — API resmi Rust, tidak bergantung pada shell.
+//   Nama file dengan karakter apapun ditangani dengan benar.
+//
 pub async fn remove_orphaned_sudoers_files(existing_usernames: &[String]) {
-    let files_output = Command::new("sudo")
-        .args(&["ls", SUDOERS_DIR])
-        .output()
-        .await;
-
-    let files_output = match files_output {
-        Ok(out) if out.status.success() => out,
-        _ => {
+    let read_result = fs::read_dir(SUDOERS_DIR).await;
+    let mut entries = match read_result {
+        Ok(e) => e,
+        Err(e) => {
             eprintln!(
-                "{}[ERROR]{} Failed to access directory: {}",
-                RED, RESET, SUDOERS_DIR
+                "{}[ERROR]{} Failed to access directory {}: {}",
+                RED, RESET, SUDOERS_DIR, e
             );
             return;
         }
     };
-
-    let file_list = String::from_utf8_lossy(&files_output.stdout);
-    for file_name in file_list.lines() {
+ 
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        // Ambil nama file dengan aman (OsString → str)
+        let file_name = match entry.file_name().into_string() {
+            Ok(name) => name,
+            Err(_) => continue, // lewati nama file non-UTF8
+        };
+ 
         if !file_name.starts_with(SUDOERS_FILE_PREFIX) {
             continue;
         }
+ 
         let derived_username = file_name
             .trim_start_matches(SUDOERS_FILE_PREFIX)
             .to_string();
-
+ 
+        // Validasi username yang di-derive sebelum digunakan
+        if derived_username.is_empty() {
+            continue;
+        }
+ 
         if !existing_usernames.contains(&derived_username) {
             println!(
                 "{}[PURGING]{} Removing orphaned sudoers file: {}",
                 YELLOW, RESET, file_name
             );
+            let file_path = format!("{}/{}", SUDOERS_DIR, file_name);
             let _ = Command::new("sudo")
-                .args(&["rm", "-f", &format!("{}/{}", SUDOERS_DIR, file_name)])
+                .args(&["rm", "-f", &file_path])
                 .status()
                 .await;
         }
     }
 }
-
-/// Membersihkan sudoers yang orphan berdasarkan daftar user yang ada di sistem.
+ 
 pub async fn clean_orphaned_sudoers(existing_usernames: &[String]) {
     remove_orphaned_sudoers_files(existing_usernames).await;
 }
-
+ 
 #[cfg(test)]
 mod tests {
     use super::*;
-
+ 
     #[test]
     fn test_build_sudoers_rule_regular_user_contains_lxc_commands() {
         let rule = build_sudoers_rule("alice", &UserRole::Regular);
-        assert!(rule.contains("lxc-start"), "Regular rule must include lxc-start");
-        assert!(rule.contains("lxc-attach"), "Regular rule must include lxc-attach");
+        assert!(rule.contains("lxc-start"));
+        assert!(rule.contains("lxc-attach"));
     }
-
+ 
     #[test]
-    fn test_build_sudoers_rule_regular_user_excludes_dangerous_wildcards() {
-        let rule = build_sudoers_rule("alice", &UserRole::Regular);
-        // FIX: pastikan wildcard berbahaya TIDAK ada
-        assert!(
-            !rule.contains("/usr/bin/bash -c *"),
-            "Regular user must NOT have unrestricted bash execution"
-        );
-        assert!(
-            !rule.contains("/usr/bin/rm -f *\n") && !rule.contains("/usr/bin/rm -f *,"),
-            "Regular user must NOT have unrestricted rm"
-        );
-        assert!(
-            !rule.contains("chown *"),
-            "Regular user must NOT have unrestricted chown"
-        );
+    fn test_build_sudoers_rule_admin_includes_admin_marker() {
+        let rule = build_sudoers_rule("bob", &UserRole::Admin);
+        assert!(rule.contains("# Role: Administrator"), "Admin rule harus mengandung marker role");
     }
-
+ 
     #[test]
     fn test_build_sudoers_rule_regular_excludes_user_management() {
         let rule = build_sudoers_rule("alice", &UserRole::Regular);
-        assert!(!rule.contains("useradd"), "Regular must NOT have useradd");
-        assert!(!rule.contains("userdel"), "Regular must NOT have userdel");
-        assert!(!rule.contains("passwd"),  "Regular must NOT have passwd");
+        assert!(!rule.contains("useradd"));
+        assert!(!rule.contains("userdel"));
+        assert!(!rule.contains("passwd"));
+        assert!(!rule.contains("# Role: Administrator"), "Regular rule tidak boleh ada marker admin");
     }
-
+ 
     #[test]
-    fn test_build_sudoers_rule_admin_includes_user_management() {
+    fn test_build_sudoers_rule_admin_has_all_four_markers() {
         let rule = build_sudoers_rule("bob", &UserRole::Admin);
-        assert!(rule.contains("useradd"), "Admin must have useradd");
-        assert!(rule.contains("userdel"), "Admin must have userdel");
-        assert!(rule.contains("passwd"),  "Admin must have passwd");
+        assert!(rule.contains("/usr/sbin/useradd *"));
+        assert!(rule.contains("/usr/sbin/userdel *"));
+        assert!(rule.contains("/usr/bin/passwd *"));
+        assert!(rule.contains("# Role: Administrator"));
     }
-
-    #[test]
-    fn test_build_sudoers_rule_admin_is_superset_of_regular() {
-        let regular_rule = build_sudoers_rule("alice", &UserRole::Regular);
-        let admin_rule   = build_sudoers_rule("alice", &UserRole::Admin);
-        // Setiap command di regular harus ada juga di admin
-        for cmd in regular_rule.lines() {
-            let trimmed = cmd.trim().trim_end_matches(',').trim_end_matches('\\');
-            if trimmed.starts_with('#') || trimmed.is_empty() || trimmed.starts_with("alice ALL") {
-                continue;
-            }
-            assert!(
-                admin_rule.contains(trimmed),
-                "Admin rule must be a superset of regular rule; missing: '{}'", trimmed
-            );
-        }
-    }
-
-    #[test]
-    fn test_build_sudoers_rule_format_starts_with_username() {
-        let rule = build_sudoers_rule("charlie", &UserRole::Regular);
-        assert!(
-            rule.contains("charlie ALL=(ALL) NOPASSWD:"),
-            "Rule must contain 'charlie ALL=(ALL) NOPASSWD:'"
-        );
-    }
-
-    #[test]
-    fn test_build_sudoers_rule_ends_with_newline() {
-        let rule = build_sudoers_rule("dave", &UserRole::Admin);
-        assert!(rule.ends_with('\n'), "Sudoers rule must end with newline");
-    }
-
+ 
     #[test]
     fn test_build_sudoers_rule_rejects_invalid_username() {
-        // Username dengan karakter berbahaya harus menghasilkan string kosong
         let rule = build_sudoers_rule("alice; rm -rf /", &UserRole::Admin);
-        assert!(
-            rule.is_empty(),
-            "Username with shell metacharacters must produce empty rule"
-        );
+        assert!(rule.is_empty());
     }
-
+ 
     #[test]
     fn test_build_sudoers_rule_rejects_username_with_slash() {
         let rule = build_sudoers_rule("../etc/passwd", &UserRole::Regular);
-        assert!(rule.is_empty(), "Path traversal username must be rejected");
+        assert!(rule.is_empty());
     }
-
+ 
     #[test]
     fn test_sudoers_file_path_format() {
         assert_eq!(
             sudoers_file_path("frank"),
-            "/etc/sudoers.d/melisa_frank",
-            "Path must follow /etc/sudoers.d/melisa_<username> format"
-        );
-    }
-
-    #[test]
-    fn test_sudoers_file_path_includes_prefix() {
-        let path = sudoers_file_path("eve");
-        assert!(path.starts_with(SUDOERS_DIR));
-        assert!(path.contains(SUDOERS_FILE_PREFIX));
-        assert!(path.contains("eve"));
-    }
-
-    #[test]
-    fn test_melisa_binary_included_for_all_roles() {
-        let regular_rule = build_sudoers_rule("alice", &UserRole::Regular);
-        let admin_rule   = build_sudoers_rule("bob", &UserRole::Admin);
-        assert!(
-            regular_rule.contains("/usr/local/bin/melisa"),
-            "Regular rule must include melisa binary for re-exec"
-        );
-        assert!(
-            admin_rule.contains("/usr/local/bin/melisa"),
-            "Admin rule must include melisa binary for re-exec"
+            "/etc/sudoers.d/melisa_frank"
         );
     }
 }

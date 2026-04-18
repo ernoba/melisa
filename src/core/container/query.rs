@@ -150,28 +150,77 @@ pub async fn send_command(name: &str, command_args: &[&str]) {
 
 /// Reads a tar stream from stdin and extracts it inside a container.
 pub async fn upload_to_container(container_name: &str, dest_path: &str) {
-    let extract_cmd = format!(
-        "mkdir -p {dest} && tar -xzf - -C {dest}",
-        dest = dest_path
-    );
+    use std::path::Path;
+    use tokio::process::Command;
+    use std::process::Stdio;
+    use crate::core::container::types::LXC_BASE_PATH;
+    use crate::cli::color::{GREEN, RED, RESET};
+ 
+    // Validasi dest_path dengan filter yang sama seperti client
+    // Tolak karakter berbahaya secara eksplisit
+    let forbidden_in_path: &[char] = &['\0', '\n', '\r', ';', '&', '|', '$', '`', '>', '<'];
+    for ch in forbidden_in_path {
+        if dest_path.contains(*ch) {
+            eprintln!(
+                "{}[ERROR]{} Destination path mengandung karakter terlarang: {:?}",
+                RED, RESET, ch
+            );
+            return;
+        }
+    }
+ 
+    // Pastikan dest_path adalah path absolut (mulai dengan /)
+    // untuk mencegah interpretasi ambigu
+    if !dest_path.starts_with('/') {
+        eprintln!(
+            "{}[ERROR]{} Destination path harus absolut (diawali dengan '/').",
+            RED, RESET
+        );
+        return;
+    }
+ 
+    // Langkah 1: Buat direktori tujuan dengan perintah terpisah (tanpa shell)
+    let mkdir_status = Command::new("sudo")
+        .args(&[
+            "lxc-attach",
+            "-P", LXC_BASE_PATH,
+            "-n", container_name,
+            "--",
+            "mkdir", "-p", dest_path,  // dest_path sebagai argumen, bukan string shell
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+ 
+    if !mkdir_status.map(|s| s.success()).unwrap_or(false) {
+        eprintln!(
+            "{}[ERROR]{} Gagal membuat direktori '{}' di container.",
+            RED, RESET, dest_path
+        );
+        return;
+    }
+ 
+    // Langkah 2: Ekstrak tar dari stdin ke direktori tujuan (tanpa shell)
     let status = Command::new("sudo")
         .args(&[
             "lxc-attach",
             "-P", LXC_BASE_PATH,
             "-n", container_name,
             "--",
-            "bash", "-c", &extract_cmd,
+            "tar", "-xzf", "-", "-C", dest_path,  // dest_path sebagai argumen tar, bukan shell
         ])
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
         .await;
+ 
     match status {
         Ok(s) if s.success() => {
             println!(
                 "{}[SUCCESS]{} Upload and extraction to '{}:{}' completed successfully.",
-                crate::cli::color::GREEN, RESET, container_name, dest_path
+                GREEN, RESET, container_name, dest_path
             );
         }
         _ => {

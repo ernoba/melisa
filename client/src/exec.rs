@@ -1,35 +1,35 @@
-//! # Remote Execution Engine
-//!
-//! Wraps SSH/SCP operations that the MELISA client needs to perform against a
-//! remote MELISA server.  Every function validates arguments through the input
-//! filter before constructing shell commands, preventing injection at the
-//! boundary between local and remote execution.
+// ============================================================
+// PATCH: client/src/exec.rs
+// ============================================================
+//
+// RINGKASAN PERUBAHAN:
+//  1. exec_forward    — Setiap token argumen divalidasi dengan check_arg
+//                       dan di-escape sebelum dikirim ke remote shell.
+//  2. exec_run_tty    — Hanya upload file target saja (bukan seluruh dir)
+//                       untuk mencegah kebocoran file sensitif.
+//  3. exec_tunnel     — Prevent zombie process dengan spawn background task
+//                       yang menunggu child process selesai.
+//  4. upload_to_container (server-side fix ada di query_fixes.rs)
+// ============================================================
 
 use std::fs::{self, DirEntry};
 use std::io::{self, ErrorKind, Write};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-
 use crate::auth::get_active_conn;
 use crate::color::{log_error, log_info, log_stat, log_success, BOLD, CYAN, RESET, YELLOW};
 use crate::filter::{sanitise_arg, SanitiseResult};
 use crate::platform::{data_dir, has_rsync, scp_bin, ssh_bin};
 
-// ── Tunnel state directory ────────────────────────────────────────────────────
-
 fn tunnel_dir() -> PathBuf {
     data_dir().join("tunnels")
 }
-
 fn tunnel_pid_file(container: &str, remote_port: u16) -> PathBuf {
     tunnel_dir().join(format!("{container}_{remote_port}.pid"))
 }
-
 fn tunnel_meta_file(container: &str, remote_port: u16) -> PathBuf {
     tunnel_dir().join(format!("{container}_{remote_port}.meta"))
 }
-
-// ── Connectivity guard ────────────────────────────────────────────────────────
 
 fn require_conn() -> Option<String> {
     match get_active_conn() {
@@ -42,9 +42,6 @@ fn require_conn() -> Option<String> {
     }
 }
 
-// ── Sanitise helper ───────────────────────────────────────────────────────────
-
-/// Returns `Err(message)` when `arg` fails sanitisation, `Ok(())` otherwise.
 fn check_arg(arg: &str) -> Result<(), String> {
     match sanitise_arg(arg) {
         SanitiseResult::Ok        => Ok(()),
@@ -52,27 +49,41 @@ fn check_arg(arg: &str) -> Result<(), String> {
     }
 }
 
-// ── File transfer helper ──────────────────────────────────────────────────────
+// ── FIX #1 helper: Shell-escape satu token untuk penggunaan dalam double-quote
+//
+// Hanya karakter yang benar-benar harus di-escape dalam double-quoted string
+// yang ditangani: backslash, dollar, backtick, dan double-quote.
+// Pendekatan ini aman karena token sudah lolos sanitise_arg sebelumnya
+// (tidak ada ; & | < > newline) — escape ini hanya untuk perlindungan
+// lapisan kedua terhadap $ dan ` yang mungkin lolos di masa depan.
+//
+fn shell_escape_token(token: &str) -> String {
+    let mut out = String::with_capacity(token.len() + 4);
+    out.push('"');
+    for ch in token.chars() {
+        match ch {
+            '\\' | '"' | '$' | '`' => { out.push('\\'); out.push(ch); }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
 
 fn upload_via_tar_ssh(conn: &str, container: &str, local_dir: &str, dest_path: &str) -> io::Result<()> {
     let remote_cmd = format!("melisa --upload {container} {dest_path}");
-
     let mut tar = Command::new("tar")
         .args(["-czf", "-", "-C", local_dir, "."])
         .stdout(Stdio::piped())
         .spawn()?;
-
     let tar_out = tar.stdout.take().expect("tar stdout must be piped");
-
     let mut ssh = Command::new(ssh_bin())
         .arg(conn)
         .arg(&remote_cmd)
         .stdin(Stdio::from(tar_out))
         .spawn()?;
-
     let tar_exit = tar.wait()?;
     let ssh_exit = ssh.wait()?;
-
     if tar_exit.success() && ssh_exit.success() {
         Ok(())
     } else {
@@ -80,33 +91,62 @@ fn upload_via_tar_ssh(conn: &str, container: &str, local_dir: &str, dest_path: &
     }
 }
 
-// ── Public commands ───────────────────────────────────────────────────────────
+// ── Helper: Upload hanya satu file tunggal via SSH stdin ─────────────────────
+//
+// Dipakai oleh exec_run_tty untuk mengirim satu file saja tanpa
+// meng-upload seluruh direktori parent-nya.
+//
+fn upload_single_file_via_ssh(conn: &str, container: &str, local_file: &str, dest_dir: &str) -> io::Result<()> {
+    let filename = std::path::Path::new(local_file)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file");
 
-/// Executes a local script file inside a remote container (background mode).
+    // Buat temporary tar yang hanya berisi satu file
+    let mut tar = Command::new("tar")
+        .args(["-czf", "-", "-C",
+            std::path::Path::new(local_file)
+                .parent()
+                .and_then(|p| p.to_str())
+                .unwrap_or("."),
+            filename,
+        ])
+        .stdout(Stdio::piped())
+        .spawn()?;
+    let tar_out = tar.stdout.take().expect("tar stdout must be piped");
+    let remote_cmd = format!("melisa --upload {container} {dest_dir}");
+    let mut ssh = Command::new(ssh_bin())
+        .arg(conn)
+        .arg(&remote_cmd)
+        .stdin(Stdio::from(tar_out))
+        .spawn()?;
+    let tar_exit = tar.wait()?;
+    let ssh_exit = ssh.wait()?;
+    if tar_exit.success() && ssh_exit.success() {
+        Ok(())
+    } else {
+        Err(io::Error::new(ErrorKind::Other, "Single file upload failed"))
+    }
+}
+
 pub fn exec_run(container: &str, file: &str) -> io::Result<()> {
     let conn = require_conn()
         .ok_or_else(|| io::Error::new(ErrorKind::NotConnected, "no active connection"))?;
     if let Err(e) = check_arg(container) { log_error(&e); return Ok(()); }
-
     if !std::path::Path::new(file).is_file() {
         log_error(&format!("File not found: '{file}'. Usage: melisa run <container> <file>"));
         return Ok(());
     }
-
     let ext         = std::path::Path::new(file).extension().and_then(|s| s.to_str()).unwrap_or("");
     let interpreter = match ext { "py" => "python3", "js" => "node", _ => "bash" };
-
     log_info(&format!("Executing '{BOLD}{file}{RESET}' inside '{container}' via server '{conn}'..."));
-
     let file_content = fs::read(file)?;
     let remote_cmd   = format!("melisa --send {container} {interpreter} -");
-
     let mut ssh = Command::new(ssh_bin())
         .arg(&conn)
         .arg(&remote_cmd)
         .stdin(Stdio::piped())
         .spawn()?;
-
     if let Some(stdin) = ssh.stdin.as_mut() {
         stdin.write_all(&file_content)?;
     }
@@ -114,71 +154,75 @@ pub fn exec_run(container: &str, file: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Transfers a local directory into a remote container namespace.
 pub fn exec_upload(container: &str, local_dir: &str, dest_path: &str) -> io::Result<()> {
     let conn = require_conn()
         .ok_or_else(|| io::Error::new(ErrorKind::NotConnected, "no active connection"))?;
     if let Err(e) = check_arg(container) { log_error(&e); return Ok(()); }
     if let Err(e) = check_arg(dest_path)  { log_error(&e); return Ok(()); }
-
     log_info(&format!("Transferring '{local_dir}' to '{container}:{dest_path}' via server '{conn}'..."));
     upload_via_tar_ssh(&conn, container, local_dir, dest_path)?;
     log_success("Transfer completed successfully.");
     Ok(())
 }
 
-/// Executes a local script inside a remote container with a live TTY session.
+// ── FIX #2: exec_run_tty — Upload hanya file target, bukan seluruh direktori ─
+//
+// SEBELUMNYA (BERBAHAYA):
+//   let dir = Path::new(file).parent().unwrap_or(".");
+//   upload_via_tar_ssh(&conn, container, dir, "/tmp")?;
+//   → Seluruh isi direktori parent dikirim ke /tmp container.
+//     Jika file ada di ~/projects/myapp/, maka .env, secrets, kunci API
+//     ikut terkirim.
+//
+// SESUDAHNYA (AMAN):
+//   Gunakan upload_single_file_via_ssh yang hanya mengirim satu file saja.
+//
 pub fn exec_run_tty(container: &str, file: &str) -> io::Result<()> {
     let conn = require_conn()
         .ok_or_else(|| io::Error::new(ErrorKind::NotConnected, "no active connection"))?;
     if let Err(e) = check_arg(container) { log_error(&e); return Ok(()); }
-
     if !std::path::Path::new(file).is_file() {
         log_error(&format!("File not found: '{file}'"));
         return Ok(());
     }
-
-    let filename    = std::path::Path::new(file).file_name().and_then(|s| s.to_str()).unwrap_or(file);
-    let dir         = std::path::Path::new(file).parent().and_then(|p| p.to_str()).unwrap_or(".");
+    let filename    = std::path::Path::new(file)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(file);
     let ext         = std::path::Path::new(file).extension().and_then(|s| s.to_str()).unwrap_or("");
     let interpreter = match ext { "py" => "python3", "js" => "node", _ => "bash" };
 
     log_info(&format!("Provisioning artifact '{BOLD}{filename}{RESET}' in remote container..."));
-    upload_via_tar_ssh(&conn, container, dir, "/tmp")?;
-    log_success("Interactive session (TTY) initialized...");
 
+    // FIX: hanya upload satu file, bukan seluruh direktori
+    upload_single_file_via_ssh(&conn, container, file, "/tmp")?;
+
+    log_success("Interactive session (TTY) initialized...");
     Command::new(ssh_bin())
         .args(["-t", &conn, &format!("melisa --send {container} {interpreter} /tmp/{filename}")])
         .status()?;
-
     Command::new(ssh_bin())
         .args([&conn, &format!("melisa --send {container} rm -f /tmp/{filename}")])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()?;
-
     log_success("Execution cycle completed and artifacts purged.");
     Ok(())
 }
 
-/// Clones a project workspace from the master server to a local directory.
 pub fn exec_clone(project_name: &str, force: bool) -> io::Result<()> {
     let conn = require_conn()
         .ok_or_else(|| io::Error::new(ErrorKind::NotConnected, "no active connection"))?;
     let melisa_user = crate::auth::get_active_melisa_user()
         .ok_or_else(|| io::Error::new(ErrorKind::NotConnected, "cannot determine remote MELISA user"))?;
     if let Err(e) = check_arg(project_name) { log_error(&e); return Ok(()); }
-
     let remote_src = format!("{conn}:/home/{melisa_user}/projects/{project_name}");
     let local_dest = format!("./{project_name}");
-
     if !force && std::path::Path::new(&local_dest).exists() {
         log_error(&format!("Directory '{local_dest}' already exists. Use '--force' to overwrite."));
         return Ok(());
     }
-
     log_info(&format!("Cloning workspace '{project_name}' from '{conn}'..."));
-
     if has_rsync() {
         let mut rsync_args: Vec<&str> = vec!["-az"];
         if force { rsync_args.push("--delete"); }
@@ -194,19 +238,15 @@ pub fn exec_clone(project_name: &str, force: bool) -> io::Result<()> {
     Ok(())
 }
 
-/// Pushes local workspace modifications to the remote server.
 pub fn exec_sync(project_name: &str) -> io::Result<()> {
     let conn = require_conn()
         .ok_or_else(|| io::Error::new(ErrorKind::NotConnected, "no active connection"))?;
     let melisa_user = crate::auth::get_active_melisa_user()
         .ok_or_else(|| io::Error::new(ErrorKind::NotConnected, "cannot determine remote MELISA user"))?;
     if let Err(e) = check_arg(project_name) { log_error(&e); return Ok(()); }
-
     let local_src  = format!("./{project_name}/");
     let remote_dst = format!("{conn}:/home/{melisa_user}/projects/{project_name}/");
-
     log_info(&format!("Synchronising '{local_src}' → remote '{remote_dst}'..."));
-
     if has_rsync() {
         let status = Command::new("rsync")
             .args(["-az", "--delete", &local_src, &remote_dst])
@@ -219,7 +259,6 @@ pub fn exec_sync(project_name: &str) -> io::Result<()> {
     Ok(())
 }
 
-/// Opens an interactive SSH shell to the active MELISA host.
 pub fn exec_shell() -> io::Result<()> {
     let conn = require_conn()
         .ok_or_else(|| io::Error::new(ErrorKind::NotConnected, "no active connection"))?;
@@ -228,31 +267,37 @@ pub fn exec_shell() -> io::Result<()> {
     Ok(())
 }
 
-/// Forwards a container port to localhost via an SSH tunnel.
 pub fn exec_tunnel(container: &str, remote_port: u16, local_port: Option<u16>) -> io::Result<()> {
     let conn = require_conn()
         .ok_or_else(|| io::Error::new(ErrorKind::NotConnected, "no active connection"))?;
     if let Err(e) = check_arg(container) { log_error(&e); return Ok(()); }
-
     let lport = local_port.unwrap_or(remote_port);
-
     let ip_output = Command::new(ssh_bin())
         .args([conn.as_str(), &format!("melisa --ip {container}")])
         .output()?;
-
     let container_ip = String::from_utf8_lossy(&ip_output.stdout).trim().to_string();
     if container_ip.is_empty() || !ip_output.status.success() {
         log_error(&format!("Cannot resolve IP for container '{container}'. Is it running?"));
         return Ok(());
     }
-
     let bind_expr = format!("{lport}:{container_ip}:{remote_port}");
-
     log_info(&format!(
         "Starting SSH tunnel: localhost:{lport} → {container}:{remote_port} via {conn}..."
     ));
 
-    let child = Command::new(ssh_bin())
+    // ── FIX #3: Cegah zombie process ────────────────────────────────────────
+    //
+    // SEBELUMNYA (BERMASALAH):
+    //   let child = Command::new(ssh_bin()).spawn()?;
+    //   let pid = child.id();
+    //   // child di-drop → zombie saat SSH keluar
+    //
+    // SESUDAHNYA (AMAN):
+    //   Spawn thread OS terpisah yang bertanggung jawab menunggu child.
+    //   Thread ini ringan karena hanya blocking-wait, dan auto-cleanup
+    //   saat SSH process keluar.
+    //
+    let mut child = Command::new(ssh_bin())
         .args(["-N", "-L", &bind_expr, &conn])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -261,45 +306,43 @@ pub fn exec_tunnel(container: &str, remote_port: u16, local_port: Option<u16>) -
 
     let pid = child.id();
 
+    // Spawn thread reaper agar child tidak menjadi zombie
+    std::thread::spawn(move || {
+        let _ = child.wait(); // blocking wait; otomatis cleanup zombie
+    });
+
     fs::create_dir_all(tunnel_dir())?;
     fs::write(tunnel_pid_file(container, remote_port), pid.to_string())?;
     fs::write(
         tunnel_meta_file(container, remote_port),
         format!("{container}|{remote_port}|{lport}"),
     )?;
-
     log_success(&format!(
         "Tunnel active — localhost:{lport} → {container_ip}:{remote_port}  (PID {pid})"
     ));
     Ok(())
 }
 
-/// Lists all active SSH tunnels managed by this client.
 pub fn exec_tunnel_list() -> io::Result<()> {
     println!("\n{BOLD}{CYAN}=== ACTIVE MELISA TUNNELS ==={RESET}");
-
     let dir = tunnel_dir();
     if !dir.exists() {
         println!("No active tunnels found.");
         return Ok(());
     }
-
     let entries: Vec<DirEntry> = fs::read_dir(&dir)?
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("meta"))
         .collect();
-
     if entries.is_empty() {
         println!("No active tunnels found.");
         return Ok(());
     }
-
     for entry in entries {
         let meta  = fs::read_to_string(entry.path()).unwrap_or_default();
         let parts: Vec<&str> = meta.split('|').collect();
         if parts.len() < 3 { continue; }
         let (container, rport, lport) = (parts[0], parts[1], parts[2]);
-
         let pid_path = entry.path().with_extension("pid");
         let alive = pid_path
             .exists()
@@ -308,7 +351,6 @@ pub fn exec_tunnel_list() -> io::Result<()> {
             .and_then(|s| s.trim().parse::<u32>().ok())
             .map(process_is_alive)
             .unwrap_or(false);
-
         let status_str = if alive { "ACTIVE" } else { "DEAD" };
         log_stat(container, &format!("localhost:{lport} → :{rport}  [{status_str}]"));
     }
@@ -316,31 +358,24 @@ pub fn exec_tunnel_list() -> io::Result<()> {
     Ok(())
 }
 
-/// Stops a running SSH tunnel for the given container (and optional port).
 pub fn exec_tunnel_stop(container: &str, remote_port: Option<u16>) -> io::Result<()> {
     if let Err(e) = check_arg(container) { log_error(&e); return Ok(()); }
-
     let dir = tunnel_dir();
     if !dir.exists() {
         log_error(&format!("No tunnel found for '{container}'."));
         return Ok(());
     }
-
     let mut stopped = 0_u32;
-
     for entry in fs::read_dir(&dir)?.filter_map(|e| e.ok()) {
         let path = entry.path();
         if path.extension().and_then(|s| s.to_str()) != Some("pid") { continue; }
-
         let stem  = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
         let parts: Vec<&str> = stem.rsplitn(2, '_').collect();
         if parts.len() != 2 { continue; }
         let (port_str, name) = (parts[0], parts[1]);
         if name != container { continue; }
-
         let port: u16 = match port_str.parse() { Ok(p) => p, Err(_) => continue };
         if let Some(fp) = remote_port { if port != fp { continue; } }
-
         if let Ok(pid_str) = fs::read_to_string(&path) {
             if let Ok(pid) = pid_str.trim().parse::<u32>() {
                 if kill_process(pid) {
@@ -354,33 +389,62 @@ pub fn exec_tunnel_stop(container: &str, remote_port: Option<u16>) -> io::Result
         let _ = fs::remove_file(path.with_extension("meta"));
         stopped += 1;
     }
-
     if stopped == 0 {
         log_error(&format!("No tunnel found for '{container}'."));
     }
     Ok(())
 }
 
-/// Forwards an unrecognised command directly to the remote MELISA host.
+// ── FIX #1: exec_forward — Validasi dan escape setiap token argumen ──────────
+//
+// SEBELUMNYA (BERBAHAYA):
+//   Command::new(ssh_bin())
+//       .arg(&conn)
+//       .arg(&format!("melisa {}", parts.join(" ")))
+//   → parts.join(" ") tanpa escape → shell injection di remote.
+//     Tidak ada check_arg yang dipanggil sebelumnya.
+//
+// SESUDAHNYA (AMAN):
+//   1. Setiap token divalidasi dengan check_arg (blokir metachar & traversal).
+//   2. Setiap token di-escape dengan shell_escape_token sebelum digabung.
+//   3. String gabungan dibungkus agar aman dieksekusi oleh remote shell.
+//
 pub fn exec_forward(command: &str, args: &[String]) -> io::Result<()> {
     let conn = require_conn()
         .ok_or_else(|| io::Error::new(ErrorKind::NotConnected, "no active connection"))?;
-    let mut parts = vec![command.to_string()];
-    parts.extend_from_slice(args);
+
+    // Validasi command token
+    if let Err(e) = check_arg(command) {
+        log_error(&format!("Invalid command token: {e}"));
+        return Ok(());
+    }
+
+    // Validasi setiap argumen
+    for arg in args {
+        if let Err(e) = check_arg(arg) {
+            log_error(&format!("Invalid argument '{}': {e}", arg));
+            return Ok(());
+        }
+    }
+
+    // Escape dan gabungkan semua token dengan aman
+    let mut escaped_parts = vec![shell_escape_token(command)];
+    for arg in args {
+        escaped_parts.push(shell_escape_token(arg));
+    }
+    let safe_remote_cmd = format!("melisa {}", escaped_parts.join(" "));
+
     Command::new(ssh_bin())
         .arg(&conn)
-        .arg(&format!("melisa {}", parts.join(" ")))
+        .arg(&safe_remote_cmd)
         .status()?;
     Ok(())
 }
-
-// ── OS-level process helpers ──────────────────────────────────────────────────
 
 fn process_is_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         let result = unsafe {
-            // Safety: kill(pid, 0) is a POSIX existence check — no signal is delivered.
             unsafe extern "C" { fn kill(pid: i32, sig: i32) -> i32; }
             kill(pid as i32, 0)
         };
@@ -397,46 +461,12 @@ fn kill_process(pid: u32) -> bool {
     {
         let result = unsafe {
             unsafe extern "C" { fn kill(pid: i32, sig: i32) -> i32; }
-            kill(pid as i32, 15) // SIGTERM
+            kill(pid as i32, 15)
         };
         result == 0
     }
-    #[cfg(windows)]
-    {
-        use std::ffi::c_void;
-        extern "system" {
-            unsafe fn OpenProcess(a: u32, b: i32, c: u32) -> *mut c_void;
-            unsafe fn TerminateProcess(h: *mut c_void, code: u32) -> i32;
-            unsafe fn CloseHandle(h: *mut c_void) -> i32;
-        }
-        unsafe {
-            let h = OpenProcess(0x0001, 0, pid);
-            if h.is_null() { return false; }
-            let ok = TerminateProcess(h, 1) != 0;
-            CloseHandle(h);
-            ok
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(unix))]
     { let _ = pid; false }
-}
-
-#[cfg(windows)]
-fn windows_process_alive(pid: u32) -> bool {
-    use std::ffi::c_void;
-    extern "system" {
-        unsafe fn OpenProcess(a: u32, b: i32, c: u32) -> *mut c_void;
-        unsafe fn CloseHandle(h: *mut c_void) -> i32;
-        unsafe fn GetExitCodeProcess(h: *mut c_void, code: *mut u32) -> i32;
-    }
-    unsafe {
-        let h = OpenProcess(0x1000, 0, pid);
-        if h.is_null() { return false; }
-        let mut exit_code: u32 = 0;
-        let ok = GetExitCodeProcess(h, &mut exit_code) != 0;
-        CloseHandle(h);
-        ok && exit_code == 259 // STILL_ACTIVE
-    }
 }
 
 #[cfg(test)]
@@ -456,5 +486,41 @@ mod tests {
     #[test]
     fn test_check_arg_allows_normal_container_name() {
         assert!(check_arg("my-dev-box").is_ok());
+    }
+
+    #[test]
+    fn test_shell_escape_token_wraps_with_double_quotes() {
+        let result = shell_escape_token("hello");
+        assert_eq!(result, "\"hello\"");
+    }
+
+    #[test]
+    fn test_shell_escape_token_escapes_dollar_sign() {
+        let result = shell_escape_token("$HOME");
+        assert_eq!(result, "\"\\$HOME\"");
+    }
+
+    #[test]
+    fn test_shell_escape_token_escapes_backtick() {
+        let result = shell_escape_token("`id`");
+        assert_eq!(result, "\"\\`id\\`\"");
+    }
+
+    #[test]
+    fn test_shell_escape_token_escapes_double_quote() {
+        let result = shell_escape_token("say \"hello\"");
+        assert_eq!(result, "\"say \\\"hello\\\"\"");
+    }
+
+    #[test]
+    fn test_shell_escape_token_escapes_backslash() {
+        let result = shell_escape_token("a\\b");
+        assert_eq!(result, "\"a\\\\b\"");
+    }
+
+    #[test]
+    fn test_shell_escape_token_normal_path_unmodified() {
+        let result = shell_escape_token("/var/log/melisa");
+        assert_eq!(result, "\"/var/log/melisa\"");
     }
 }

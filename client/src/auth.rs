@@ -1,13 +1,21 @@
-//! # Authentication & Profile Management
-//!
-//! Manages MELISA remote server profiles. Format on disk:
-//! `<profile_name>=<ssh_user>@<host>|<melisa_user>`
+// ============================================================
+// PATCH: client/src/auth.rs
+// ============================================================
+//
+// RINGKASAN PERUBAHAN:
+//  1. deploy_ssh_key        — Hapus interpolasi pub_key ke shell string.
+//                             Gunakan stdin pipe ke `sh` di remote agar
+//                             tidak ada shell quoting yang bisa di-escape.
+//  2. auth_add              — Validasi melisa_user input dari stdin
+//                             menggunakan fungsi validate_username baru.
+//  3. configure_ssh_multiplexing — Tambah validasi karakter untuk `host`
+//                             dan `user` sebelum ditulis ke SSH config.
+// ============================================================
 
 use std::fs::{self, OpenOptions};
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
 use crate::color::{log_error, log_info, log_success, log_warning, BOLD, CYAN, GREEN, RESET, YELLOW};
 use crate::filter::{validate_profile_name, validate_user_host};
 use crate::platform::{
@@ -15,12 +23,8 @@ use crate::platform::{
     ssh_dir, ssh_keygen_bin, ssh_sockets_dir, ssh_bin,
 };
 
-// ── File paths ────────────────────────────────────────────────────────────────
-
 fn profile_file() -> PathBuf { config_dir().join("profiles.conf") }
 fn active_file()  -> PathBuf { config_dir().join("active") }
-
-// ── Internal helpers ──────────────────────────────────────────────────────────
 
 fn read_profiles() -> io::Result<String> {
     match fs::read_to_string(profile_file()) {
@@ -63,7 +67,51 @@ fn set_perms_600(path: &Path) {
     }
 }
 
-// ── Initialisation ────────────────────────────────────────────────────────────
+// ── FIX #2: Validasi username MELISA ─────────────────────────────────────────
+//
+// SEBELUMNYA: tidak ada validasi sama sekali pada input username.
+// SESUDAHNYA: hanya izinkan huruf, angka, hyphen, dan underscore;
+//             panjang dibatasi antara 1–32 karakter sesuai batas POSIX.
+//
+fn validate_username(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.len() > 32 {
+        return Err(format!(
+            "Username '{}' harus antara 1–32 karakter.", name
+        ));
+    }
+    // POSIX: username tidak boleh dimulai dengan angka atau '-'
+    if name.starts_with(|c: char| c.is_ascii_digit() || c == '-') {
+        return Err(format!(
+            "Username '{}' tidak boleh diawali angka atau '-'.", name
+        ));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err(format!(
+            "Username '{}' hanya boleh mengandung huruf, angka, '-', dan '_'.", name
+        ));
+    }
+    Ok(())
+}
+
+// ── FIX #3: Validasi karakter SSH config ─────────────────────────────────────
+//
+// Periksa bahwa nilai host/user tidak mengandung karakter yang bisa
+// menyuntikkan directive baru ke dalam SSH config file.
+//
+fn validate_ssh_config_value(value: &str, field: &str) -> io::Result<()> {
+    // Newline dan carriage-return bisa inject directive baru ke config file.
+    // Spasi dan '#' juga berbahaya dalam nilai SSH config.
+    let forbidden: &[char] = &['\n', '\r', '\0', '#'];
+    for ch in forbidden {
+        if value.contains(*ch) {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("SSH config {field} mengandung karakter terlarang: {ch:?}"),
+            ));
+        }
+    }
+    Ok(())
+}
 
 pub fn init_auth() -> io::Result<()> {
     let dir = config_dir();
@@ -74,9 +122,6 @@ pub fn init_auth() -> io::Result<()> {
     Ok(())
 }
 
-// ── Public getters ────────────────────────────────────────────────────────────
-
-/// Returns `user@host` for the active profile.
 pub fn get_active_conn() -> Option<String> {
     let active = fs::read_to_string(active_file()).ok()?.trim().to_string();
     if active.is_empty() { return None; }
@@ -91,7 +136,6 @@ pub fn get_active_conn() -> Option<String> {
     None
 }
 
-/// Returns the MELISA application username for the active profile.
 pub fn get_active_melisa_user() -> Option<String> {
     let active   = fs::read_to_string(active_file()).ok()?.trim().to_string();
     let profiles = read_profiles().ok()?;
@@ -110,35 +154,39 @@ pub fn get_active_melisa_user() -> Option<String> {
     None
 }
 
-// ── Profile management ────────────────────────────────────────────────────────
-
 pub fn auth_add(name: &str, user_host: &str) -> io::Result<()> {
     validate_profile_name(name)
         .map_err(|e| io::Error::new(ErrorKind::InvalidInput, e.to_string()))?;
     validate_user_host(user_host)
         .map_err(|e| io::Error::new(ErrorKind::InvalidInput, e))?;
-
     ensure_ssh_key()?;
-
     log_info(&format!("Deploying public SSH key to {BOLD}{user_host}{RESET}..."));
     log_info("Please prepare to enter the remote server password.");
     deploy_ssh_key(user_host)?;
-
     if has_ssh_multiplexing() {
         configure_ssh_multiplexing(user_host)?;
     }
-
     let ssh_user = user_host.split('@').next().unwrap_or("").to_string();
     print!(
         "[SETUP] Enter your MELISA username on this server \
          (leave blank to use SSH user '{ssh_user}'): "
     );
     std::io::stdout().flush()?;
-
     let mut melisa_user = String::new();
     std::io::stdin().read_line(&mut melisa_user)?;
     let melisa_user = melisa_user.trim().to_string();
-    let melisa_user = if melisa_user.is_empty() { ssh_user.clone() } else { melisa_user };
+
+    // ── FIX #2 diterapkan di sini ─────────────────────────────────────────
+    // SEBELUMNYA: langsung pakai melisa_user tanpa validasi apapun.
+    // SESUDAHNYA: validasi sebelum disimpan ke profiles.conf dan dipakai
+    //             untuk membangun path di remote server.
+    let melisa_user = if melisa_user.is_empty() {
+        ssh_user.clone()
+    } else {
+        validate_username(&melisa_user)
+            .map_err(|e| io::Error::new(ErrorKind::InvalidInput, e))?;
+        melisa_user
+    };
 
     let existing = read_profiles()?;
     let filtered: String = existing
@@ -146,10 +194,8 @@ pub fn auth_add(name: &str, user_host: &str) -> io::Result<()> {
         .filter(|l| !l.starts_with(&format!("{name}=")))
         .map(|l| format!("{l}\n"))
         .collect();
-
     write_profiles(&format!("{filtered}{name}={user_host}|{melisa_user}\n"))?;
     fs::write(active_file(), name)?;
-
     log_success(&format!(
         "Server profile '{name}' registered. Remote MELISA user: {melisa_user}"
     ));
@@ -212,15 +258,12 @@ pub fn auth_list() -> io::Result<()> {
         .unwrap_or_default()
         .trim()
         .to_string();
-
     println!("\n{BOLD}{CYAN}=== MELISA REMOTE SERVER REGISTRY ==={RESET}");
-
     let profiles = read_profiles()?;
     if profiles.trim().is_empty() {
         println!("No servers are currently registered. Add one using 'melisa auth add <n> <user@host>'.");
         return Ok(());
     }
-
     for line in profiles.lines() {
         let parts: Vec<&str> = line.splitn(2, '=').collect();
         if parts.len() != 2 || parts[0].is_empty() { continue; }
@@ -233,7 +276,6 @@ pub fn auth_list() -> io::Result<()> {
         } else {
             format!(" [melisa: {mel_user}]")
         };
-
         if name == active {
             println!("  {GREEN}* {name}{RESET} \t({conn}){mel_tag} {YELLOW}<- [ACTIVE]{RESET}");
         } else {
@@ -243,8 +285,6 @@ pub fn auth_list() -> io::Result<()> {
     println!();
     Ok(())
 }
-
-// ── SSH key helpers ───────────────────────────────────────────────────────────
 
 fn ensure_ssh_key() -> io::Result<()> {
     let key_path = ssh_dir().join("id_ed25519");
@@ -256,11 +296,9 @@ fn ensure_ssh_key() -> io::Result<()> {
     fs::create_dir_all(&ssh_d)?;
     #[cfg(unix)]
     set_perms_700(&ssh_d);
-
     let status = Command::new(ssh_keygen_bin())
         .args(["-t", "ed25519", "-f", key_path.to_str().unwrap_or(""), "-N", "", "-q"])
         .status()?;
-
     if status.success() {
         log_success("Cryptographic identity (Ed25519) successfully generated.");
         Ok(())
@@ -270,6 +308,19 @@ fn ensure_ssh_key() -> io::Result<()> {
     }
 }
 
+// ── FIX #1: deploy_ssh_key — Hilangkan interpolasi pub_key ke shell string ───
+//
+// SEBELUMNYA (BERBAHAYA):
+//   let remote_cmd = format!("echo '{pub_key}' >> ~/.ssh/authorized_keys");
+//   Jika pub_key mengandung ' (misal di bagian comment), attacker bisa inject
+//   perintah ke remote server.
+//
+// SESUDAHNYA (AMAN):
+//   Kirim isi public key melalui STDIN ssh, bukan lewat argumen string.
+//   Script remote sepenuhnya hardcoded — tidak ada data user yang
+//   diinterpolasi ke dalam shell command.
+//   Pola ini identik dengan cara kerja ssh-copy-id.
+//
 fn deploy_ssh_key(user_host: &str) -> io::Result<()> {
     if has_ssh_copy_id() {
         let status = Command::new("ssh-copy-id").arg(user_host).status()?;
@@ -286,15 +337,39 @@ fn deploy_ssh_key(user_host: &str) -> io::Result<()> {
         return Err(io::Error::new(ErrorKind::NotFound, "No SSH public key found."));
     }
 
-    let pub_key    = fs::read_to_string(&key_path)?.trim().to_string();
-    let remote_cmd = format!(
-        "mkdir -p ~/.ssh && chmod 700 ~/.ssh && \
-         echo '{pub_key}' >> ~/.ssh/authorized_keys && \
-         chmod 600 ~/.ssh/authorized_keys"
-    );
+    let pub_key = fs::read_to_string(&key_path)?.trim().to_string();
 
-    let status = Command::new(ssh_bin()).args([user_host, &remote_cmd]).status()?;
+    // Validasi pub_key: harus satu baris dan tidak mengandung newline
+    // (kunci publik yang valid selalu satu baris).
+    if pub_key.contains('\n') || pub_key.contains('\r') {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "Public key file mengandung multiple baris — format tidak valid.",
+        ));
+    }
 
+    // Script remote sepenuhnya hardcoded; data dikirim lewat stdin, bukan
+    // diinterpolasi ke dalam command string.
+    // `cat >> authorized_keys` membaca dari stdin yang kita pipe.
+    let remote_script = "\
+        mkdir -p ~/.ssh && \
+        chmod 700 ~/.ssh && \
+        cat >> ~/.ssh/authorized_keys && \
+        chmod 600 ~/.ssh/authorized_keys";
+
+    let mut child = Command::new(ssh_bin())
+        .args([user_host, remote_script])
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+
+    // Kirim public key + newline ke stdin remote script
+    if let Some(mut stdin) = child.stdin.take() {
+        // Tulis key + newline agar baris baru ditambahkan dengan benar
+        stdin.write_all(format!("{pub_key}\n").as_bytes())?;
+        // stdin ditutup otomatis saat drop → remote `cat` selesai membaca
+    }
+
+    let status = child.wait()?;
     if status.success() {
         log_success("SSH public key deployed to remote server.");
         Ok(())
@@ -304,28 +379,35 @@ fn deploy_ssh_key(user_host: &str) -> io::Result<()> {
     }
 }
 
+// ── FIX #3: configure_ssh_multiplexing — Validasi host & user ────────────────
+//
+// SEBELUMNYA: host dan user diinterpolasi langsung ke string SSH config
+//             tanpa pemeriksaan karakter berbahaya.
+// SESUDAHNYA: validasi kedua nilai sebelum menulis ke file config.
+//
 fn configure_ssh_multiplexing(user_host: &str) -> io::Result<()> {
     let Some(sockets_dir) = ssh_sockets_dir() else { return Ok(()); };
     let host = user_host.split('@').nth(1).unwrap_or(user_host);
     let user = user_host.split('@').next().unwrap_or("");
 
+    // FIX: validasi sebelum menulis ke SSH config file
+    validate_ssh_config_value(host, "host")?;
+    validate_ssh_config_value(user, "user")?;
+
     let ssh_config_path = ssh_dir().join("config");
     let existing_cfg    = fs::read_to_string(&ssh_config_path).unwrap_or_default();
     if existing_cfg.contains(&format!("Host {host}")) { return Ok(()); }
-
     fs::create_dir_all(&sockets_dir)?;
     #[cfg(unix)]
     {
         set_perms_700(&sockets_dir);
         set_perms_700(&ssh_dir());
     }
-
     let stanza = format!(
         "\nHost {host}\n    User {user}\n    ControlMaster auto\n    \
          ControlPath {}/%r@%h:%p\n    ControlPersist 10m\n",
         sockets_dir.display()
     );
-
     let mut file = OpenOptions::new().create(true).append(true).open(&ssh_config_path)?;
     file.write_all(stanza.as_bytes())?;
     #[cfg(unix)]
@@ -336,6 +418,58 @@ fn configure_ssh_multiplexing(user_host: &str) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_validate_username_allows_valid_names() {
+        assert!(validate_username("alice").is_ok());
+        assert!(validate_username("alice_123").is_ok());
+        assert!(validate_username("dev-user").is_ok());
+    }
+
+    #[test]
+    fn test_validate_username_rejects_empty() {
+        assert!(validate_username("").is_err());
+    }
+
+    #[test]
+    fn test_validate_username_rejects_path_traversal() {
+        assert!(validate_username("../etc/passwd").is_err());
+        assert!(validate_username("../../root").is_err());
+    }
+
+    #[test]
+    fn test_validate_username_rejects_shell_metachar() {
+        assert!(validate_username("user; rm -rf /").is_err());
+        assert!(validate_username("$(whoami)").is_err());
+        assert!(validate_username("user|cat").is_err());
+    }
+
+    #[test]
+    fn test_validate_username_rejects_too_long() {
+        let long = "a".repeat(33);
+        assert!(validate_username(&long).is_err());
+    }
+
+    #[test]
+    fn test_validate_username_rejects_leading_digit() {
+        assert!(validate_username("1user").is_err());
+    }
+
+    #[test]
+    fn test_validate_ssh_config_value_rejects_newline() {
+        assert!(validate_ssh_config_value("host\nHost evil", "host").is_err());
+    }
+
+    #[test]
+    fn test_validate_ssh_config_value_rejects_carriage_return() {
+        assert!(validate_ssh_config_value("host\rProxyJump attacker", "host").is_err());
+    }
+
+    #[test]
+    fn test_validate_ssh_config_value_allows_normal_hostname() {
+        assert!(validate_ssh_config_value("192.168.1.10", "host").is_ok());
+        assert!(validate_ssh_config_value("my-server.local", "host").is_ok());
+    }
 
     #[test]
     fn test_get_active_conn_does_not_panic() {
