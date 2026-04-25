@@ -252,7 +252,7 @@ async fn apply_orbstack_lxcnet_override(audit: bool) -> Result<bool, String> {
     // ── Step 4: Restart lxc-net with retry logic ──────────────────────────────
     let max_retries = 3;
     let mut last_error = String::new();
-    
+
     for attempt in 1..=max_retries {
         if attempt > 1 {
             let backoff_secs = 2_u64.pow((attempt - 1) as u32);
@@ -262,16 +262,50 @@ async fn apply_orbstack_lxcnet_override(audit: bool) -> Result<bool, String> {
             );
             tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs)).await;
         }
+
+        // --- NEW PRE-RESTART CLEANUP LOGIC ---
+        // 1. Terminate orphaned dnsmasq processes
+        println!("  {}[CLEANUP]{} Purging blocked sockets and interfaces...", YELLOW, RESET);
         
+        // 1. Matikan proses apapun yang menahan port 53 di IP 10.0.3.1
+        let _ = Command::new("sudo")
+            .args(&["-n", "fuser", "-k", "53/tcp"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+            
+        let _ = Command::new("sudo")
+            .args(&["-n", "fuser", "-k", "53/udp"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+
+        let _ = Command::new("sudo")
+            .args(&["-n", "killall", "dnsmasq"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+
+        // 2. Tear down bridge interface
+        let _ = Command::new("sudo")
+            .args(&["-n", "ip", "link", "delete", "lxcbr0"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await;
+        // -------------------------------------
+
         println!("  {}[ATTEMPT {}/{}]{} Restarting lxc-net...", YELLOW, attempt, max_retries, RESET);
-        
         let restart_status = Command::new("sudo")
             .args(&["-n", "systemctl", "restart", "lxc-net"])
             .stdout(if audit { Stdio::inherit() } else { Stdio::null() })
             .stderr(if audit { Stdio::inherit() } else { Stdio::null() })
             .status()
             .await;
-
+        
         match restart_status {
             Ok(s) if s.success() => {
                 println!(
