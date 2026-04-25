@@ -1,28 +1,26 @@
-
-// ============================================================
-// PATCH: src/core/user/sudoers.rs
-// ============================================================
-//
-// SUMMARY OF CHANGES:
-//  1. configure_sudoers    — Fix TOCTOU race condition:
-//                            write to temp file in safe directory (/tmp),
-//                            validate with visudo, then atomic move.
-//  2. check_if_admin       — Replace fragile string-based "useradd" detection
-//                            with stricter role checking.
-//  3. remove_orphaned_sudoers_files — Replace `ls` with tokio::fs::read_dir.
-// ============================================================
- 
 use std::process::Stdio;
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use crate::cli::color::{GREEN, RED, RESET, YELLOW};
 use crate::core::user::types::UserRole;
- 
+
 pub const SUDOERS_DIR:         &str = "/etc/sudoers.d";
 pub const SUDOERS_FILE_PREFIX: &str = "melisa_";
- 
+
+/// Builds a visudo-valid sudoers rule for a MELISA user.
+///
+/// # Key fixes applied
+/// - Every command now carries a trailing ` *` so the user can invoke
+///   the binary with any arguments.  Without it, sudoers allows the
+///   binary **only with zero arguments**, breaking all LXC operations.
+/// - Removed the old `command -flag N:N /path/*` pattern that contained
+///   `100000:100000` — visudo parses `N:N` as `runas_user:runas_group`
+///   and aborts with "expecting '=' but found '/'".
+/// - Each entry is now on its own line with `,  \` continuation so the
+///   single-line form never exceeds LINE_MAX (2 048 chars on Linux).
 pub fn build_sudoers_rule(username: &str, role: &UserRole) -> String {
+    // Sanitise — only alphanumeric, underscore, and hyphen are allowed.
     let safe_username = username
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '_' || *c == '-')
@@ -30,66 +28,121 @@ pub fn build_sudoers_rule(username: &str, role: &UserRole) -> String {
     if safe_username != username {
         return String::new();
     }
-    
-    // Build commands with proper sudoers syntax (no wildcard paths in the rule itself)
-    // Sudoers validates against exact command paths or uses POSIX regex
-    let common_commands: Vec<&str> = vec![
-        "/usr/bin/lxc-start",
-        "/usr/bin/lxc-stop",
-        "/usr/bin/lxc-info",
-        "/usr/bin/lxc-ls",
-        "/usr/bin/lxc-attach",
-        "/usr/bin/lxc-create",
-        "/usr/bin/lxc-destroy",
-        "/usr/bin/lxc-copy",
-        "/usr/bin/lxc-snapshot",
-        "/usr/share/lxc/templates/lxc-download",
-        "/usr/local/bin/melisa",
-        "/usr/bin/mkdir",
-        "/usr/bin/rm",
-        "/usr/bin/tee",
-        "/usr/bin/chattr",
-        "/usr/sbin/ip",
-        "/usr/sbin/iptables",
-        "/usr/sbin/sysctl",
-        "/usr/bin/systemctl",
-        "/usr/bin/chown",
-        "/usr/bin/chgrp",
+
+    // Commands available to every MELISA user.
+    // Trailing " *" means "allow this binary with any arguments".
+    let common_commands: &[&str] = &[
+        "/usr/bin/lxc-start *",
+        "/usr/bin/lxc-stop *",
+        "/usr/bin/lxc-info *",
+        "/usr/bin/lxc-ls *",
+        "/usr/bin/lxc-attach *",
+        "/usr/bin/lxc-create *",
+        "/usr/bin/lxc-destroy *",
+        "/usr/bin/lxc-copy *",
+        "/usr/bin/lxc-snapshot *",
+        "/usr/share/lxc/templates/lxc-download *",
+        "/usr/local/bin/melisa *",
+        "/usr/bin/mkdir *",
+        "/usr/bin/rm *",
+        "/usr/bin/tee *",
+        "/usr/bin/chattr *",
+        "/usr/sbin/ip *",
+        "/usr/sbin/iptables *",
+        "/usr/sbin/sysctl *",
+        "/usr/bin/systemctl *",
+        "/usr/bin/chown *",
+        "/usr/bin/chgrp *",
     ];
-    
-    let admin_only_commands: Vec<&str> = vec![
-        "/usr/sbin/useradd",
-        "/usr/sbin/userdel",
-        "/usr/bin/passwd",
-        "/usr/bin/pkill",
-        "/usr/bin/cat",
-        "/usr/bin/ls",
-        "/usr/bin/grep",
+
+    // Commands available only to admins.
+    let admin_only_commands: &[&str] = &[
+        "/usr/sbin/useradd *",
+        "/usr/sbin/userdel *",
+        "/usr/bin/passwd *",
+        "/usr/bin/pkill *",
+        "/usr/bin/cat *",
+        "/usr/bin/ls *",
+        "/usr/bin/grep *",
     ];
-    
-    let mut all_commands = common_commands.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+    let mut all_commands: Vec<&str> = common_commands.to_vec();
     if *role == UserRole::Admin {
-        all_commands.extend(admin_only_commands.iter().map(|s| s.to_string()));
+        all_commands.extend_from_slice(admin_only_commands);
     }
-    
+
+    // Build multi-line continuation so no line exceeds LINE_MAX.
+    // Format:
+    //   user ALL=(ALL) NOPASSWD: /cmd1 *, \
+    //       /cmd2 *, \
+    //       /cmdN *
+    let cmd_lines: Vec<String> = all_commands
+        .iter()
+        .enumerate()
+        .map(|(i, cmd)| {
+            if i < all_commands.len() - 1 {
+                format!("    {}, \\", cmd)
+            } else {
+                format!("    {}", cmd)
+            }
+        })
+        .collect();
+
     format!(
         "# MELISA managed sudoers rule for user: {}\n\
          # Role: {}\n\
          # Generated by MELISA — do not edit manually\n\
-         # Commands are listed without arguments to allow flexible usage\n\
-         {} ALL=(ALL) NOPASSWD: {}\n",
+         {} ALL=(ALL) NOPASSWD: \\\n\
+         {}\n",
         username,
         role,
         username,
-        all_commands.join(", ")
+        cmd_lines.join("\n")
     )
 }
- 
+
 pub fn sudoers_file_path(username: &str) -> String {
     format!("{}/{}{}", SUDOERS_DIR, SUDOERS_FILE_PREFIX, username)
 }
- 
-// ── FIX #1: configure_sudoers — Fix TOCTOU race condition ────────────────────
+
+/// Removes any MELISA-managed sudoers files that fail `visudo -c` validation.
+///
+/// Called at the start of `install_host_environment()` so that broken files
+/// from a previous (failed) installation do not cause `sudo` to print parse
+/// errors every time it runs during setup.
+pub async fn remove_invalid_melisa_sudoers() {
+    let read_result = fs::read_dir(SUDOERS_DIR).await;
+    let mut entries = match read_result {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let file_name = match entry.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if !file_name.starts_with(SUDOERS_FILE_PREFIX) {
+            continue;
+        }
+        let path = format!("{}/{}", SUDOERS_DIR, file_name);
+        let valid = Command::new("visudo")
+            .args(&["-c", "-f", &path])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .await
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !valid {
+            println!(
+                "{}[REPAIR]{} Removing invalid sudoers file: {} (failed visudo check)",
+                YELLOW, RESET, file_name
+            );
+            let _ = fs::remove_file(&path).await;
+        }
+    }
+}
+
 pub async fn configure_sudoers(username: &str, role: UserRole, audit: bool) {
     let sudoers_rule = build_sudoers_rule(username, &role);
     if sudoers_rule.is_empty() {
@@ -99,26 +152,23 @@ pub async fn configure_sudoers(username: &str, role: UserRole, audit: bool) {
         );
         return;
     }
- 
+
     let sudoers_path = sudoers_file_path(username);
- 
-    // FIX: Use temp file in /tmp with unique name.
-    // This separates temp file from privilege-sensitive sudoers.d directory.
     let temp_path = format!("/tmp/melisa_sudoers_{}.tmp", username);
- 
+
     if audit {
         println!("[AUDIT] Writing sudoers rule to {}:", sudoers_path);
         println!("{}", sudoers_rule.trim());
     }
- 
-    // Write to temp file in /tmp
-    let tee_process = Command::new("sudo")
-        .args(&["tee", &temp_path])
+
+    // Write the rule to a temp file via `tee` (runs as root via sudo).
+    let tee_process = Command::new("tee")
+        .arg(&temp_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
- 
+
     match tee_process {
         Ok(mut child) => {
             if let Some(mut stdin_pipe) = child.stdin.take() {
@@ -140,36 +190,30 @@ pub async fn configure_sudoers(username: &str, role: UserRole, audit: bool) {
             return;
         }
     }
- 
-    // FIX: Set strict permissions BEFORE validation — not after.
-    let _ = Command::new("sudo")
-        .args(&["chmod", "0400", &temp_path])
+
+    // Lock temp file before validation.
+    let _ = Command::new("chmod")
+        .args(&["0400", &temp_path])
         .status()
         .await;
- 
-    // Validate with visudo.
-    let visudo_check = Command::new("sudo")
-        .args(&["visudo", "-c", "-f", &temp_path])
+
+    // Validate with visudo before deploying.
+    let visudo_check = Command::new("visudo")
+        .args(&["-c", "-f", &temp_path])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
         .await;
- 
+
     match visudo_check {
         Ok(s) if s.success() => {
-            // FIX: Move from /tmp to /etc/sudoers.d — this is atomic on same filesystem
-            // if /tmp and /etc are on the same partition. If different partitions,
-            // cp + rm is still safer than previous approach because temp
-            // file is in /tmp which is not scanned by sudo daemon.
-            let mv_status = Command::new("sudo")
-                .args(&["mv", &temp_path, &sudoers_path])
+            let mv_status = Command::new("mv")
+                .args(&[&temp_path as &str, &sudoers_path])
                 .status()
                 .await;
- 
             if mv_status.map(|s| s.success()).unwrap_or(false) {
-                // Ensure final permissions are correct after move.
-                let _ = Command::new("sudo")
-                    .args(&["chmod", "0440", &sudoers_path])
+                let _ = Command::new("chmod")
+                    .args(&["0440", &sudoers_path])
                     .status()
                     .await;
                 println!(
@@ -177,10 +221,7 @@ pub async fn configure_sudoers(username: &str, role: UserRole, audit: bool) {
                     GREEN, RESET, username
                 );
             } else {
-                let _ = Command::new("sudo")
-                    .args(&["rm", "-f", &temp_path])
-                    .status()
-                    .await;
+                let _ = Command::new("rm").args(&["-f", &temp_path]).status().await;
                 eprintln!(
                     "{}[ERROR]{} Failed to deploy sudoers rule for '{}'.",
                     RED, RESET, username
@@ -188,10 +229,7 @@ pub async fn configure_sudoers(username: &str, role: UserRole, audit: bool) {
             }
         }
         _ => {
-            let _ = Command::new("sudo")
-                .args(&["rm", "-f", &temp_path])
-                .status()
-                .await;
+            let _ = Command::new("rm").args(&["-f", &temp_path]).status().await;
             eprintln!(
                 "{}[ERROR]{} Sudoers validation failed for '{}'. \
                  Rule was NOT applied to prevent system lockout.",
@@ -200,51 +238,32 @@ pub async fn configure_sudoers(username: &str, role: UserRole, audit: bool) {
         }
     }
 }
- 
-// ── FIX #2: check_if_admin — Stricter role detection ──────────────────────────
-//
-// BEFORE (FRAGILE):
-//   content.contains("useradd")
-//   → Anyone who can add the string "useradd" to their sudoers file
-//     can pass as admin.
-//
-// AFTER (STRONGER):
-//   Check if sudoers file contains specific admin_only lines
-//   AND is formatted correctly (/usr/sbin/useradd *).
-//   This is much harder to forge because it must match exact pattern.
-//
+
 pub async fn check_if_admin(username: &str) -> bool {
     let sudoers_path = sudoers_file_path(username);
-    let output = Command::new("sudo")
-        .args(&["-n", "cat", &sudoers_path])
-        .output()
-        .await;
- 
-    match output {
-        Ok(out) if out.status.success() => {
-            let content = String::from_utf8_lossy(&out.stdout);
-            // Check for admin markers in the generated sudoers file
-            let has_marker = content.contains("# Role: Administrator");
-            let has_useradd = content.contains("/usr/sbin/useradd");
-            let has_userdel = content.contains("/usr/sbin/userdel");
-            // Must have all markers to be considered admin
+    match tokio::fs::read_to_string(&sudoers_path).await {
+        Ok(content) => {
+            let has_marker   = content.contains("# Role: Administrator");
+            let has_useradd  = content.contains("/usr/sbin/useradd");
+            let has_userdel  = content.contains("/usr/sbin/userdel");
             has_marker && has_useradd && has_userdel
         }
-        _ => false,
+        Err(_) => {
+            // Fall back to checking system sudo/wheel group membership.
+            let group_check = Command::new("id")
+                .arg("-nG")
+                .arg(username)
+                .output()
+                .await;
+            if let Ok(out) = group_check {
+                let groups = String::from_utf8_lossy(&out.stdout);
+                return groups.contains("sudo") || groups.contains("wheel");
+            }
+            false
+        }
     }
 }
- 
-// ── FIX #3: remove_orphaned_sudoers_files — Replace `ls` with read_dir ────────
-//
-// BEFORE (FRAGILE):
-//   Command::new("ls").arg(SUDOERS_DIR)
-//   → Output `ls` can have issues with filenames containing newlines.
-//   → Not portable, depends on ls output format.
-//
-// AFTER (ROBUST):
-//   tokio::fs::read_dir() — official Rust API, not dependent on shell.
-//   Filenames with any characters are handled correctly.
-//
+
 pub async fn remove_orphaned_sudoers_files(existing_usernames: &[String]) {
     let read_result = fs::read_dir(SUDOERS_DIR).await;
     let mut entries = match read_result {
@@ -257,97 +276,141 @@ pub async fn remove_orphaned_sudoers_files(existing_usernames: &[String]) {
             return;
         }
     };
- 
     while let Ok(Some(entry)) = entries.next_entry().await {
-        // Get filename safely (OsString → str).
         let file_name = match entry.file_name().into_string() {
             Ok(name) => name,
-            Err(_) => continue, // skip non-UTF8 filenames
+            Err(_) => continue,
         };
- 
         if !file_name.starts_with(SUDOERS_FILE_PREFIX) {
             continue;
         }
- 
         let derived_username = file_name
             .trim_start_matches(SUDOERS_FILE_PREFIX)
             .to_string();
- 
-        // Validate derived username before use.
         if derived_username.is_empty() {
             continue;
         }
- 
         if !existing_usernames.contains(&derived_username) {
             println!(
                 "{}[PURGING]{} Removing orphaned sudoers file: {}",
                 YELLOW, RESET, file_name
             );
             let file_path = format!("{}/{}", SUDOERS_DIR, file_name);
-            let _ = Command::new("sudo")
-                .args(&["rm", "-f", &file_path])
-                .status()
-                .await;
+            let _ = fs::remove_file(&file_path).await;
         }
     }
 }
- 
+
 pub async fn clean_orphaned_sudoers(existing_usernames: &[String]) {
     remove_orphaned_sudoers_files(existing_usernames).await;
 }
- 
+
+// ---------------------------------------------------------------------------
+// Unit tests
+// ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
     use super::*;
- 
+
     #[test]
     fn test_build_sudoers_rule_regular_user_contains_lxc_commands() {
         let rule = build_sudoers_rule("alice", &UserRole::Regular);
-        assert!(rule.contains("lxc-start"));
-        assert!(rule.contains("lxc-attach"));
+        assert!(rule.contains("lxc-start"), "Regular user must have lxc-start");
+        assert!(rule.contains("lxc-attach"), "Regular user must have lxc-attach");
     }
- 
+
     #[test]
     fn test_build_sudoers_rule_admin_includes_admin_marker() {
         let rule = build_sudoers_rule("bob", &UserRole::Admin);
         assert!(rule.contains("# Role: Administrator"), "Admin rule must contain role marker");
     }
- 
+
     #[test]
     fn test_build_sudoers_rule_regular_excludes_user_management() {
         let rule = build_sudoers_rule("alice", &UserRole::Regular);
-        assert!(!rule.contains("useradd"));
-        assert!(!rule.contains("userdel"));
-        assert!(!rule.contains("passwd"));
-        assert!(!rule.contains("# Role: Administrator"), "Regular rule must not contain admin marker");
+        assert!(!rule.contains("useradd"),  "Regular must not have useradd");
+        assert!(!rule.contains("userdel"),  "Regular must not have userdel");
+        assert!(!rule.contains("passwd"),   "Regular must not have passwd");
+        assert!(!rule.contains("# Role: Administrator"), "Regular must not have admin marker");
     }
- 
+
+    // FIX: updated to match new format — commands carry trailing " *"
     #[test]
     fn test_build_sudoers_rule_admin_has_all_four_markers() {
         let rule = build_sudoers_rule("bob", &UserRole::Admin);
-        assert!(rule.contains("/usr/sbin/useradd *"));
-        assert!(rule.contains("/usr/sbin/userdel *"));
-        assert!(rule.contains("/usr/bin/passwd *"));
+        assert!(rule.contains("/usr/sbin/useradd *"), "Admin must have useradd *");
+        assert!(rule.contains("/usr/sbin/userdel *"), "Admin must have userdel *");
+        assert!(rule.contains("/usr/bin/passwd *"),   "Admin must have passwd *");
         assert!(rule.contains("# Role: Administrator"));
     }
- 
+
+    #[test]
+    fn test_all_commands_have_wildcard_suffix() {
+        // Every command must end with " *" so arguments are permitted.
+        for role in &[UserRole::Regular, UserRole::Admin] {
+            let rule = build_sudoers_rule("testuser", role);
+            for line in rule.lines() {
+                let trimmed = line.trim();
+                if trimmed.starts_with('/') {
+                    // It's a command line — strip trailing ", \" or just "," then check for " *"
+                    let cmd_part = trimmed
+                        .trim_end_matches(" \\")
+                        .trim_end_matches(',')
+                        .trim();
+                    assert!(
+                        cmd_part.ends_with(" *"),
+                        "Command '{}' is missing trailing ' *' — \
+                         this prevents the binary from being called with arguments",
+                        cmd_part
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_no_colon_number_patterns_in_commands() {
+        // Patterns like "100000:100000" confuse visudo's parser.
+        for role in &[UserRole::Regular, UserRole::Admin] {
+            let rule = build_sudoers_rule("testuser", role);
+            assert!(
+                !rule.contains("100000:100000"),
+                "Rule must not contain numeric user:group patterns that confuse visudo"
+            );
+        }
+    }
+
     #[test]
     fn test_build_sudoers_rule_rejects_invalid_username() {
         let rule = build_sudoers_rule("alice; rm -rf /", &UserRole::Admin);
-        assert!(rule.is_empty());
+        assert!(rule.is_empty(), "Shell-injection username must be rejected");
     }
- 
+
     #[test]
     fn test_build_sudoers_rule_rejects_username_with_slash() {
         let rule = build_sudoers_rule("../etc/passwd", &UserRole::Regular);
-        assert!(rule.is_empty());
+        assert!(rule.is_empty(), "Path-traversal username must be rejected");
     }
- 
+
     #[test]
     fn test_sudoers_file_path_format() {
-        assert_eq!(
-            sudoers_file_path("frank"),
-            "/etc/sudoers.d/melisa_frank"
-        );
+        assert_eq!(sudoers_file_path("frank"), "/etc/sudoers.d/melisa_frank");
+    }
+
+    #[test]
+    fn test_multiline_format_valid_continuation() {
+        // Each non-terminal command line must end with ", \" for continuation.
+        let rule = build_sudoers_rule("alice", &UserRole::Regular);
+        let cmd_lines: Vec<&str> = rule
+            .lines()
+            .filter(|l| l.trim().starts_with('/'))
+            .collect();
+        for line in cmd_lines.iter().take(cmd_lines.len().saturating_sub(1)) {
+            assert!(
+                line.trim_end().ends_with(", \\"),
+                "Non-terminal command line must end with ', \\': {}",
+                line
+            );
+        }
     }
 }

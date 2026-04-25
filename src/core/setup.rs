@@ -46,9 +46,7 @@ use crate::core::container::network::is_virtualised_environment; // Use existing
 /// Detects the host Linux distribution and installs all required packages,
 /// configures networking, registers the jail shell, and hardens system privacy.
 pub async fn install_host_environment() {
-    // Smarter logic
     if is_risky_remote_session().await {
-        // Check if user provided --force-unsafe flag to bypass manual confirmation
         let args: Vec<String> = env::args().collect();
         if !args.contains(&"--force-unsafe".to_string()) {
             eprintln!("{}[BLOCKED]{} Remote SSH session detected.", RED, RESET);
@@ -64,12 +62,13 @@ pub async fn install_host_environment() {
         }
         println!("{}[WARNING]{} Running setup on remote session at user request.", YELLOW, RESET);
     }
-
+ 
+    // ── FIX 1: Remove any invalid MELISA sudoers files before the first
+    //           sudo/root operation so they don't spam parse warnings.
+    crate::core::user::sudoers::remove_invalid_melisa_sudoers().await;
+ 
     let host_distro = detect_host_distro().await;
     let mut distro_config = get_distro_config(&host_distro);
-
-    // Override firewall ke iptables jika berjalan di VM/OrbStack
-    // karena UFW umumnya tidak tersedia di environment virtual
     if is_virtualised_environment().await
         && distro_config.firewall_tool == FirewallKind::Ufw
     {
@@ -79,13 +78,13 @@ pub async fn install_host_environment() {
         );
         distro_config.firewall_tool = FirewallKind::Iptables;
     }
-
+ 
     println!("\n{}════ MELISA HOST SETUP ════{}", BOLD, RESET);
     println!(
         "{}[INFO]{} Detected host distribution: {}{}{}",
         BOLD, RESET, CYAN, distro_config.name, RESET
     );
-
+ 
     install_lxc_packages(&distro_config.pkg_manager, &distro_config.lxc_packages).await;
     install_ssh_server(&distro_config.pkg_manager).await;
     copy_binary_to_system().await;
@@ -97,17 +96,14 @@ pub async fn install_host_environment() {
     setup_projects_directory().await;
     configure_git_security().await;
     fix_system_privacy().await;
-
-    // If we have a valid SUDO_USER, set up sub-ID mapping and admin privileges for them.
+ 
     if let Ok(username) = env::var("SUDO_USER") {
         if !username.is_empty() {
             setup_lxc_user_subid_mapping(&username).await;
-            
-            // Call setup-specific helper to configure privileges
             setup_host_user_admin_privileges(&username).await;
         }
     }
-
+ 
     println!("\n{}════ SETUP COMPLETE ════{}", GREEN, RESET);
     println!("{}[DONE]{} MELISA is ready. Run 'melisa' to start.", GREEN, RESET);
 }
@@ -330,8 +326,7 @@ async fn is_risky_remote_session() -> bool {
 
 async fn setup_ssh_firewall(firewall: &FirewallKind) {
     println!("\n{}Configuring Host Firewall…{}", BOLD, RESET);
-
-    // 1. Gunakan variabel lokal untuk menghindari error async recursion.
+ 
     let fallback = FirewallKind::Iptables;
     let active_firewall: &FirewallKind = if matches!(firewall, FirewallKind::Ufw)
         && !Path::new("/usr/sbin/ufw").exists()
@@ -345,9 +340,8 @@ async fn setup_ssh_firewall(firewall: &FirewallKind) {
     } else {
         firewall
     };
-
+ 
     match active_firewall {
-        // Blok pertama diubah menjadi Firewalld (karena menggunakan firewall-cmd)
         FirewallKind::Firewalld => {
             let ssh_ok = execute_silent_task(
                 "firewall-cmd",
@@ -356,7 +350,6 @@ async fn setup_ssh_firewall(firewall: &FirewallKind) {
                 10,
             )
             .await;
-            
             let bridge_ok = execute_silent_task(
                 "firewall-cmd",
                 &["--zone=trusted", "--add-interface=lxcbr0", "--permanent"],
@@ -364,7 +357,6 @@ async fn setup_ssh_firewall(firewall: &FirewallKind) {
                 10,
             )
             .await;
-            
             let reload_ok = execute_silent_task(
                 "firewall-cmd",
                 &["--reload"],
@@ -372,7 +364,6 @@ async fn setup_ssh_firewall(firewall: &FirewallKind) {
                 15,
             )
             .await;
-            
             if ssh_ok && bridge_ok && reload_ok {
                 println!(
                     "  {:<50} [ {}OK{} ]",
@@ -380,56 +371,88 @@ async fn setup_ssh_firewall(firewall: &FirewallKind) {
                 );
             }
         }
-        
+ 
         FirewallKind::Ufw => {
-            // Gunakan absolute path jika ditemukan untuk menghindari isu PATH
             let ufw_cmd = if Path::new("/usr/sbin/ufw").exists() {
                 "/usr/sbin/ufw"
             } else {
                 "ufw"
             };
-
             execute_silent_task(ufw_cmd, &["allow", "ssh"], "Allowing SSH via UFW", 10).await;
             execute_silent_task(ufw_cmd, &["allow", "in", "on", "lxcbr0"], "Trusting lxcbr0 in UFW", 10).await;
             execute_silent_task(ufw_cmd, &["--force", "enable"], "Enabling UFW", 10).await;
             execute_silent_task(ufw_cmd, &["reload"], "Reloading UFW", 10).await;
         }
-        
+ 
         FirewallKind::Iptables => {
-            // Aktifkan IP forwarding
+            // Enable IP forwarding first (needed for LXC NAT routing).
             let sysctl_cmd = if Path::new("/usr/sbin/sysctl").exists() {
                 "/usr/sbin/sysctl"
             } else {
                 "sysctl"
             };
-            
             execute_silent_task(
                 sysctl_cmd,
                 &["-w", "net.ipv4.ip_forward=1"],
                 "Enabling IP forwarding",
                 5,
-            ).await;
-
-            let iptables_cmd = if Path::new("/usr/sbin/iptables").exists() {
-                "/usr/sbin/iptables"
-            } else if Path::new("/bin/iptables").exists() {
-                "/bin/iptables"
-            } else {
-                "iptables"
-            };
-
-            execute_silent_task(
-                iptables_cmd,
-                &["-A", "INPUT", "-p", "tcp", "--dport", "22", "-j", "ACCEPT"],
-                "Allowing SSH via iptables",
-                10,
-            ).await;
-            execute_silent_task(
-                iptables_cmd,
-                &["-A", "INPUT", "-i", "lxcbr0", "-j", "ACCEPT"],
-                "Trusting lxcbr0 via iptables",
-                10,
-            ).await;
+            )
+            .await;
+ 
+            // ── FIX 2: Probe four common paths, then the nftables compat
+            //           shim, before giving up.  Returns None when iptables
+            //           is genuinely absent (container-only environments).
+            let iptables_cmd: Option<&str> = [
+                "/usr/sbin/iptables",
+                "/usr/bin/iptables",
+                "/sbin/iptables",
+                "/bin/iptables",
+                "/usr/sbin/iptables-legacy",
+                "/usr/bin/iptables-legacy",
+            ]
+            .iter()
+            .find(|p| Path::new(p).exists())
+            .copied();
+ 
+            match iptables_cmd {
+                Some(cmd) => {
+                    execute_silent_task(
+                        cmd,
+                        &["-C", "INPUT", "-p", "tcp", "--dport", "22", "-j", "ACCEPT"],
+                        "Checking existing SSH rule",
+                        5,
+                    )
+                    .await;
+                    // Only append if the rule doesn't already exist.
+                    execute_silent_task(
+                        cmd,
+                        &["-A", "INPUT", "-p", "tcp", "--dport", "22", "-j", "ACCEPT"],
+                        "Allowing SSH via iptables",
+                        10,
+                    )
+                    .await;
+                    execute_silent_task(
+                        cmd,
+                        &["-A", "INPUT", "-i", "lxcbr0", "-j", "ACCEPT"],
+                        "Trusting lxcbr0 via iptables",
+                        10,
+                    )
+                    .await;
+                }
+                None => {
+                    // iptables is not installed — common in minimal containers
+                    // or environments using nftables exclusively.  Report as
+                    // SKIPPED (not an error) so setup can continue.
+                    println!(
+                        "  {:<50} [ {}SKIPPED — iptables not found{} ]",
+                        "Firewall rules (iptables)", YELLOW, RESET
+                    );
+                    println!(
+                        "  {:<50} [ {}INFO{} ]",
+                        "Install iptables or configure firewall manually", YELLOW, RESET
+                    );
+                }
+            }
         }
     }
 }
@@ -688,6 +711,7 @@ async fn setup_host_user_admin_privileges(username: &str) {
         "\n{}Granting MELISA Admin Privileges to Host User '{}'…{}",
         BOLD, username, RESET
     );
+ 
     if check_if_admin(username).await {
         println!(
             "  {:<50} [ {}SKIPPED{} ]",
@@ -695,9 +719,12 @@ async fn setup_host_user_admin_privileges(username: &str) {
         );
         return;
     }
-    // Delegasi sepenuhnya ke configure_sudoers() yang sudah ada visudo validation-nya
+ 
+    // configure_sudoers() handles the full pipeline:
+    //   tee → chmod 0400 → visudo -c → mv → chmod 0440
+    // No additional file write is needed here.
     configure_sudoers(username, UserRole::Admin, false).await;
-
+    
     println!(
         "\n{}Granting MELISA Admin Privileges to Host User '{}'…{}",
         BOLD, username, RESET

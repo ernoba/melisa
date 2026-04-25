@@ -95,10 +95,10 @@ pub async fn cmd_up(mel_path: &str, audit: bool) {
     print_manifest_summary(&manifest, &container_name);
 
     // ── Step 1: Provision or start the container ─────────────────────────────
+    // ── Step 1: Provision or start the container ─────────────────────────────
     let already_exists = container_exists(&container_name).await;
     if !already_exists {
         println!("\n{}[STEP 1/7]{} Provisioning new container…{}", BOLD, RESET, RESET);
-
         let (distro_list, is_from_cache) = execute_with_spinner(
             "Validating manifest distro…",
             |_pb| get_lxc_distro_list(audit),
