@@ -45,14 +45,22 @@ pub use crate::distros::abstraction::FirewallKind;
 ///
 /// Falls back to [`HostDistro::Unknown`] when the file is absent or
 /// the ID is not recognised.
+// src/distros/host_distro.rs
 pub async fn detect_host_distro() -> HostDistro {
     let os_release = fs::read_to_string("/etc/os-release")
         .await
         .unwrap_or_default();
 
+    // Cek OrbStack lebih dulu via konten penuh (bukan hanya ID=)
+    if os_release.to_lowercase().contains("orbstack") {
+        return HostDistro::OrbStack;
+    }
+
     let id_line = os_release
         .lines()
-        .find(|line| line.starts_with("ID=") || line.starts_with("ID_LIKE="))
+        .find(|line| line.starts_with("ID="))          // ← ID= saja dulu
+        .or_else(|| os_release.lines()
+            .find(|line| line.starts_with("ID_LIKE="))) // ← ID_LIKE= sebagai fallback
         .unwrap_or("");
 
     let id_value = id_line

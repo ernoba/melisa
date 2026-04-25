@@ -37,7 +37,7 @@ use crate::cli::color::{BOLD, CYAN, GREEN, RED, YELLOW, RESET};
 use crate::core::project::management::PROJECTS_MASTER_PATH;
 use crate::distros::host_distro::{detect_host_distro, get_distro_config, FirewallKind};
 
-use crate::core::user::{build_sudoers_rule, check_if_admin, UserRole};
+use crate::core::user::{build_sudoers_rule, configure_sudoers, check_if_admin, UserRole};
 use crate::core::container::network::is_virtualised_environment; // Use existing detection
 // ── Entry point ───────────────────────────────────────────────────────────────
 
@@ -66,7 +66,19 @@ pub async fn install_host_environment() {
     }
 
     let host_distro = detect_host_distro().await;
-    let distro_config = get_distro_config(&host_distro);
+    let mut distro_config = get_distro_config(&host_distro);
+
+    // Override firewall ke iptables jika berjalan di VM/OrbStack
+    // karena UFW umumnya tidak tersedia di environment virtual
+    if is_virtualised_environment().await
+        && distro_config.firewall_tool == FirewallKind::Ufw
+    {
+        println!(
+            "{}[INFO]{} Virtualised environment detected — switching firewall to iptables.",
+            YELLOW, RESET
+        );
+        distro_config.firewall_tool = FirewallKind::Iptables;
+    }
 
     println!("\n{}════ MELISA HOST SETUP ════{}", BOLD, RESET);
     println!(
@@ -316,10 +328,26 @@ async fn is_risky_remote_session() -> bool {
     true
 }
 
-/// Configures the host firewall to allow SSH and LXC bridge traffic.
 async fn setup_ssh_firewall(firewall: &FirewallKind) {
     println!("\n{}Configuring Host Firewall…{}", BOLD, RESET);
-    match firewall {
+
+    // 1. Gunakan variabel lokal untuk menghindari error async recursion.
+    let fallback = FirewallKind::Iptables;
+    let active_firewall: &FirewallKind = if matches!(firewall, FirewallKind::Ufw)
+        && !Path::new("/usr/sbin/ufw").exists()
+        && !Path::new("/sbin/ufw").exists()
+    {
+        println!(
+            "  {:<50} [ {}SKIPPED — UFW not installed, using iptables{}  ]",
+            "UFW setup", YELLOW, RESET
+        );
+        &fallback
+    } else {
+        firewall
+    };
+
+    match active_firewall {
+        // Blok pertama diubah menjadi Firewalld (karena menggunakan firewall-cmd)
         FirewallKind::Firewalld => {
             let ssh_ok = execute_silent_task(
                 "firewall-cmd",
@@ -328,6 +356,7 @@ async fn setup_ssh_firewall(firewall: &FirewallKind) {
                 10,
             )
             .await;
+            
             let bridge_ok = execute_silent_task(
                 "firewall-cmd",
                 &["--zone=trusted", "--add-interface=lxcbr0", "--permanent"],
@@ -335,6 +364,7 @@ async fn setup_ssh_firewall(firewall: &FirewallKind) {
                 10,
             )
             .await;
+            
             let reload_ok = execute_silent_task(
                 "firewall-cmd",
                 &["--reload"],
@@ -342,6 +372,7 @@ async fn setup_ssh_firewall(firewall: &FirewallKind) {
                 15,
             )
             .await;
+            
             if ssh_ok && bridge_ok && reload_ok {
                 println!(
                     "  {:<50} [ {}OK{} ]",
@@ -349,27 +380,56 @@ async fn setup_ssh_firewall(firewall: &FirewallKind) {
                 );
             }
         }
+        
         FirewallKind::Ufw => {
-            execute_silent_task("ufw", &["allow", "ssh"], "Allowing SSH via UFW", 10).await;
-            execute_silent_task("ufw", &["allow", "in", "on", "lxcbr0"], "Trusting lxcbr0 in UFW", 10).await;
-            execute_silent_task("ufw", &["--force", "enable"], "Enabling UFW", 10).await;
-            execute_silent_task("ufw", &["reload"], "Reloading UFW", 10).await;
+            // Gunakan absolute path jika ditemukan untuk menghindari isu PATH
+            let ufw_cmd = if Path::new("/usr/sbin/ufw").exists() {
+                "/usr/sbin/ufw"
+            } else {
+                "ufw"
+            };
+
+            execute_silent_task(ufw_cmd, &["allow", "ssh"], "Allowing SSH via UFW", 10).await;
+            execute_silent_task(ufw_cmd, &["allow", "in", "on", "lxcbr0"], "Trusting lxcbr0 in UFW", 10).await;
+            execute_silent_task(ufw_cmd, &["--force", "enable"], "Enabling UFW", 10).await;
+            execute_silent_task(ufw_cmd, &["reload"], "Reloading UFW", 10).await;
         }
+        
         FirewallKind::Iptables => {
+            // Aktifkan IP forwarding
+            let sysctl_cmd = if Path::new("/usr/sbin/sysctl").exists() {
+                "/usr/sbin/sysctl"
+            } else {
+                "sysctl"
+            };
+            
             execute_silent_task(
-                "iptables",
+                sysctl_cmd,
+                &["-w", "net.ipv4.ip_forward=1"],
+                "Enabling IP forwarding",
+                5,
+            ).await;
+
+            let iptables_cmd = if Path::new("/usr/sbin/iptables").exists() {
+                "/usr/sbin/iptables"
+            } else if Path::new("/bin/iptables").exists() {
+                "/bin/iptables"
+            } else {
+                "iptables"
+            };
+
+            execute_silent_task(
+                iptables_cmd,
                 &["-A", "INPUT", "-p", "tcp", "--dport", "22", "-j", "ACCEPT"],
                 "Allowing SSH via iptables",
                 10,
-            )
-            .await;
+            ).await;
             execute_silent_task(
-                "iptables",
+                iptables_cmd,
                 &["-A", "INPUT", "-i", "lxcbr0", "-j", "ACCEPT"],
                 "Trusting lxcbr0 via iptables",
                 10,
-            )
-            .await;
+            ).await;
         }
     }
 }
@@ -438,38 +498,86 @@ async fn register_melisa_shell() {
 
 /// Writes a sudoers rule allowing any user to run `sudo melisa`.
 async fn configure_system_sudoers_access() {
-    let sudo_rule = "ALL ALL=(ALL) NOPASSWD: /usr/local/bin/melisa\n";
-    let sudoers_file = "/etc/sudoers.d/melisa";
     println!("\n{}Configuring System Sudoers Access…{}", BOLD, RESET);
+    
+    // Use sudo to write the general system-wide melisa sudoers rule
+    let sudo_rule = "# Allow any user to run MELISA without password\nALL ALL=(ALL) NOPASSWD: /usr/local/bin/melisa\n";
+    let sudoers_file = "/etc/sudoers.d/melisa";
+    let temp_file = "/tmp/melisa_system_sudoers.tmp";
 
-    match OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(sudoers_file)
-        .await
-    {
-        Ok(mut file) => {
-            if let Err(err) = file.write_all(sudo_rule.as_bytes()).await {
-                println!(
-                    "  {:<50} [ {}IO ERROR{} ] {}",
-                    "Sudoers Policy", RED, RESET, err
-                );
-            } else {
-                execute_silent_task(
-                    "chmod",
-                    &["0440", sudoers_file],
-                    "Applying strict permissions (0440)",
-                    5,
-                )
+    // Write to temp file
+    let tee_process = Command::new("sudo")
+        .args(&["tee", temp_file])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    match tee_process {
+        Ok(mut child) => {
+            if let Some(mut stdin_pipe) = child.stdin.take() {
+                if let Err(err) = stdin_pipe.write_all(sudo_rule.as_bytes()).await {
+                    println!(
+                        "  {:<50} [ {}IO ERROR{} ] {}",
+                        "Sudoers Policy", RED, RESET, err
+                    );
+                    return;
+                }
+            }
+            let _ = child.wait().await;
+        }
+        Err(err) => {
+            println!(
+                "  {:<50} [ {}FATAL{} ] {}",
+                "Sudoers Policy", RED, RESET, err
+            );
+            return;
+        }
+    }
+
+    // Validate with visudo
+    let visudo_check = Command::new("sudo")
+        .args(&["visudo", "-c", "-f", temp_file])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await;
+
+    match visudo_check {
+        Ok(s) if s.success() => {
+            // Move to destination and set permissions
+            let mv_status = Command::new("sudo")
+                .args(&["mv", temp_file, sudoers_file])
+                .status()
                 .await;
+
+            if mv_status.map(|s| s.success()).unwrap_or(false) {
+                let _ = Command::new("sudo")
+                    .args(&["chmod", "0440", sudoers_file])
+                    .status()
+                    .await;
                 println!("  {:<50} [ {}OK{} ]", "Sudoers rules deployed", GREEN, RESET);
+            } else {
+                let _ = Command::new("sudo")
+                    .args(&["rm", "-f", temp_file])
+                    .status()
+                    .await;
+                println!(
+                    "  {:<50} [ {}FAILED{} ]",
+                    "Applying sudoers rules", RED, RESET
+                );
             }
         }
-        Err(err) => println!(
-            "  {:<50} [ {}ACCESS DENIED{} ] {}",
-            "Sudoers Policy", RED, RESET, err
-        ),
+        _ => {
+            let _ = Command::new("sudo")
+                .args(&["rm", "-f", temp_file])
+                .status()
+                .await;
+            println!(
+                "  {:<50} [ {}VALIDATION FAILED{} ]",
+                "Sudoers rules", RED, RESET
+            );
+        }
     }
 }
 
@@ -580,8 +688,6 @@ async fn setup_host_user_admin_privileges(username: &str) {
         "\n{}Granting MELISA Admin Privileges to Host User '{}'…{}",
         BOLD, username, RESET
     );
-
-    // Check if user already has admin access.
     if check_if_admin(username).await {
         println!(
             "  {:<50} [ {}SKIPPED{} ]",
@@ -589,6 +695,15 @@ async fn setup_host_user_admin_privileges(username: &str) {
         );
         return;
     }
+    // Delegasi sepenuhnya ke configure_sudoers() yang sudah ada visudo validation-nya
+    configure_sudoers(username, UserRole::Admin, false).await;
+
+    println!(
+        "\n{}Granting MELISA Admin Privileges to Host User '{}'…{}",
+        BOLD, username, RESET
+    );
+
+    // Check if user already has admin access.
 
     let sudoers_rule = build_sudoers_rule(username, &UserRole::Admin);
     let sudoers_path = format!("/etc/sudoers.d/melisa_{}", username);
