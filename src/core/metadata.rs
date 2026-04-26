@@ -18,6 +18,7 @@
 
 use std::path::PathBuf;
 use tokio::fs;
+use colored::*;
 
 use crate::cli::color::{BOLD, RESET, CYAN, GREEN, YELLOW};
 use crate::core::container::types::LXC_BASE_PATH;
@@ -137,6 +138,23 @@ const MELISA_AUTHOR: &str = "Erick Adriano Sebastian";
 
 /// Prints detailed version, developer info, and support request.
 pub async fn print_about() {
+    // LOGO MELISA (Tetap besar tapi warna profesional)
+    let melisa_text = vec![
+        r#""#,
+        r#""#,
+        r#" ███╗   ███╗███████╗██║     ██║███████╗███████╗ "#,
+        r#" ████╗ ████║██╔════╝██║     ██║██╔════╝██╔══██╗ "#,
+        r#" ██╔████╔██║█████╗  ██║     ██║███████╗███████║ "#,
+        r#" ██║╚██╔╝██║██╔══╝  ██║     ██║╚════██║██╔══██║ "#,
+        r#" ██║ ╚═╝ ██║███████╗███████╗██║███████║██║  ██║ "#,
+        r#" ╚═╝     ╚═╝╚══════╝╚══════╝╚═╝╚══════╝╚═╝  ╚═╝ "#,
+        r#"    [ MANAGEMENT ENVIRONMENT LINUX SANDBOX ]    "#,
+        r#""#,
+    ];
+
+    for line in melisa_text {
+        println!("  {}", line.cyan().bold());
+    }
     println!("\n{}━━━ MELISA CORE ENGINE ━━━{}", BOLD, RESET);
     println!("  {}Version    :{} {}", BOLD, RESET, MELISA_VERSION);
     println!("  {}Developer  :{} {}", BOLD, RESET, MELISA_AUTHOR);
