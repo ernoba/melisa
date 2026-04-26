@@ -13,10 +13,16 @@ path = "src/main.rs"
 [dependencies]
 # Terminal colour output — handles Windows ANSI enablement automatically
 colored = "2"
- 
+
 # Cross-platform config / data / home directory resolution
 dirs = "5"
- 
+
+# Line editing library with history and completion
+rustyline = { version = "13", features = ["derive"] }
+
+# System information retrieval
+sysinfo = "0.30"
+
 [target.'cfg(unix)'.dependencies]
 # Required for process_is_alive / kill_process on macOS and Linux
 libc = "0.2"

@@ -2,17 +2,16 @@
 //!
 //! Entry point dan command router. Berjalan native di Linux, macOS, dan Windows.
 
-mod auth;
-mod color;
-mod db;
-mod exec;
-mod filter;
 mod platform;
+mod mproto;
+mod mshell;
 
 use std::process;
-
-use color::{log_error, BOLD, CYAN, RED, RESET, YELLOW};
+use mshell::color::{log_error, BOLD, CYAN, RED, RESET, YELLOW};
 use platform::verify_dependencies;
+use mshell::auth;
+use mproto::exec;
+use mproto::filter;
 
 fn main() {
     #[cfg(target_os = "windows")]
@@ -163,6 +162,14 @@ fn main() {
             if let Err(e) = exec::exec_tunnel_stop(&rest[0], remote_port) {
                 log_error(&e.to_string());
             }
+        }
+
+        // ── Interactive Shell ─────────────────────────────────────────────────
+        "interactive" | "i" => {
+            println!("{BOLD}{CYAN}Entering MELISA interactive shell...{RESET}");
+            // Note: Interactive shell would be launched here
+            // This would require async runtime setup
+            println!("{YELLOW}Interactive mode not yet fully implemented.{RESET}");
         }
 
         // ── Help ──────────────────────────────────────────────────────────────
